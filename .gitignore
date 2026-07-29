@@ -1,0 +1,4 @@
+/target/
+/reference/pico-pio-usb-control/build/
+/.vscode/
+.DS_Store
