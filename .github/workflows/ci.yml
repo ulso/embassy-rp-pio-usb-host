@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-and-msrv:
+    name: Host checks and MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: clippy
+          targets: thumbv6m-none-eabi
+
+      - name: Run host Clippy
+        run: cargo clippy --locked --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
+
+      - name: Run host tests
+        run: cargo test --locked --all-features --target x86_64-unknown-linux-gnu
+
+      - name: Check minimal feature set
+        run: cargo check --locked --lib --no-default-features --target x86_64-unknown-linux-gnu
+
+      - name: Check embedded library at MSRV
+        run: cargo check --release --locked --lib --target thumbv6m-none-eabi
+
+  embedded:
+    name: RP2040 release build and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install release toolchain
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy,rustfmt
+          targets: thumbv6m-none-eabi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run embedded Clippy
+        run: cargo clippy --release --locked --lib --bins --examples --target thumbv6m-none-eabi -- -D warnings
+
+      - name: Build embedded release targets
+        run: cargo build --release --locked --bins --examples --target thumbv6m-none-eabi
+
+      - name: Run analyzer-variant Clippy
+        run: cargo clippy --release --locked --example bleuio --features analyzer-capture --target thumbv6m-none-eabi -- -D warnings
+
+      - name: Build analyzer variant
+        run: cargo build --release --locked --example bleuio --features analyzer-capture --target thumbv6m-none-eabi
+
+      - name: Build embedded documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --lib --all-features --no-deps --target thumbv6m-none-eabi

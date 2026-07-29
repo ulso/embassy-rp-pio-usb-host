@@ -12,12 +12,14 @@ med USB Type A Host**:
 - GPIO18 som enable-signal till kortets strömbegränsade 5 V-switch;
 - PIO0, PIO1 och DMA-kanal 0 reserverade för USB Host;
 - exakt 120 MHz systemklocka;
-- en direktansluten full-speed-enhet.
+- en direktansluten full- eller low-speed-enhet.
 
 `CdcAcmHost` är generell och descriptorstyrd. Baudrate, DTR/RTS,
 kommandosyntax, radprotokoll och svarstolkning tillhör däremot applikationen.
 BleuIO-exemplet är därför ett exempel på ett produktprotokoll ovanpå
-CDC-strömmen, inte en del av class-drivern.
+CDC-strömmen, inte en del av class-drivern. CDC-ACM använder bulk-endpoints
+och kör därför på full speed med den nuvarande RP2040-backenden; low-speed-
+stödet används av exempelvis den generella HID-drivern.
 
 ## Översikt
 
@@ -48,8 +50,20 @@ rustup target add thumbv6m-none-eabi
 cargo install elf2uf2-rs
 ```
 
-Biblioteket är ännu inte publicerat på crates.io. Lägg det nya projektet bredvid
-detta repository och använd tills vidare ett path dependency.
+Biblioteket är ännu inte publicerat på crates.io. Använd ett Git dependency
+låst till en testad commit:
+
+```toml
+embassy-rp-pio-usb-host = {
+    git = "https://github.com/ulso/embassy-rp-pio-usb-host",
+    rev = "<testad commit-SHA>",
+    default-features = false,
+    features = ["embassy-usb-host"],
+}
+```
+
+Under samtidig lokal utveckling kan Git-raderna ersättas med
+`path = "../embassy-rp-pio-usb-host"`.
 
 Ett minimalt `Cargo.toml` för samma kort är:
 
@@ -78,7 +92,7 @@ embassy-executor = {
 }
 embassy-futures = "=0.1.2"
 embassy-rp = {
-    version = "0.10.0",
+    version = "=0.10.0",
     features = [
         "critical-section-impl",
         "defmt",
@@ -106,9 +120,15 @@ inkompatibla Embassy-versioner är olika Rust-typer även om de heter samma sak.
 Releaseprofilen är också relevant eftersom PIO-backendens verifierade
 timingvägar är byggda med denna profil.
 
-## 2. Kopiera target- och linkerkonfigurationen
+## 2. Äg target- och linkerkonfigurationen i applikationen
 
-Kopiera följande tre filer från detta repository:
+Ett dependency bestämmer inte det konsumerande programmets minneslayout.
+Projektet som bygger den slutliga firmwaren måste själv äga `memory.x`,
+linkerargumenten och UF2-runnern. Om projektet redan har en fungerande
+RP2040-konfiguration ska den behållas och anpassas för det aktuella kortets
+flashstorlek.
+
+För ett nytt projekt kan följande filer användas som utgångspunkt:
 
 ```console
 export PIO_USB_HOST_REPO=/path/to/embassy-rp-pio-usb-host
@@ -116,11 +136,39 @@ export PIO_USB_HOST_REPO=/path/to/embassy-rp-pio-usb-host
 mkdir -p .cargo
 cp "$PIO_USB_HOST_REPO/.cargo/config.toml" .cargo/config.toml
 cp "$PIO_USB_HOST_REPO/rust-toolchain.toml" rust-toolchain.toml
-cp "$PIO_USB_HOST_REPO/build.rs" build.rs
 cp "$PIO_USB_HOST_REPO/memory.x" memory.x
 ```
 
-De ger projektet:
+Skapa därefter applikationens egen `build.rs`:
+
+```rust
+use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
+
+fn main() {
+    println!("cargo:rerun-if-changed=memory.x");
+
+    if env::var("TARGET").as_deref() != Ok("thumbv6m-none-eabi") {
+        return;
+    }
+
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+    File::create(out.join("memory.x"))
+        .expect("create memory.x")
+        .write_all(include_bytes!("memory.x"))
+        .expect("write memory.x");
+
+    println!("cargo:rustc-link-arg-bins=-L{}", out.display());
+    println!("cargo:rustc-link-arg-bins=--nmagic");
+    println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    println!("cargo:rustc-link-arg-bins=-Tlink-rp.x");
+    println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
+}
+```
+
+Tillsammans ger filerna projektet:
 
 - default-target `thumbv6m-none-eabi`;
 - `elf2uf2-rs --deploy` som Cargo-runner;
@@ -129,7 +177,10 @@ De ger projektet:
 - minneslayout för Feather-kortets 8 MiB flash och 264 KiB RAM.
 
 `memory.x` är kortspecifik. Kontrollera framför allt flashstorleken innan
-samma fil används för ett annat RP2040-kort.
+samma fil används för ett annat RP2040-kort. Host-bibliotekets egen
+`build.rs` kopplar bara det här repositoryts 8 MiB-layout till dess egna
+binärer och exempel; den exporterar inte layouten till ett konsumerande
+projekt.
 
 ## 3. Reservera hårdvaruresurserna
 
@@ -137,21 +188,24 @@ Den nuvarande konkreta backenden använder fasta resurser:
 
 | Funktion | RP2040-resurs |
 |---|---|
-| USB TX | PIO0, state machine 0 |
-| USB RX | PIO1, state machine 0 |
-| kant/EOP-detektering | PIO1, state machine 1 |
-| DMA | DMA channel 0 |
+| USB TX | PIO0 SM0, 48 MHz full speed / 6 MHz low speed |
+| USB RX | PIO1 SM0, 120 MHz |
+| kant/EOP-detektering | PIO1 SM1, 96 MHz full speed / 12 MHz low speed |
+| PIO1 instruktionsminne | helt upptaget, 15 + 17 instruktioner |
+| reserverad DMA-resurs | DMA channel 0, inklusive IRQ |
 | D+ | GPIO16 |
 | D− | GPIO17 |
-| VBUS-switch enable | GPIO18 |
 
 Applikationen får inte samtidigt ge dessa resurser till någon annan driver.
-GPIO18 driver inte VBUS direkt; den är endast en logiksignal till Feather-
-kortets strömbegränsade 5 V-switch.
+På Feather-kortet använder exempelapplikationen dessutom GPIO18 som
+enable-signal till den strömbegränsade 5 V-switchen och GPIO13 för status-LED.
+De två pinnarna tillhör kortapplikationen och ägs inte av
+`Rp2040PioEngine`.
 
 En annan pinout kräver för närvarande ändringar i den konkreta backenden.
-Det räcker inte att bara byta argument vid konstruktionen, eftersom även
-registeråtkomst och PIO-konfiguration är verifierade för GPIO16/GPIO17.
+Det räcker inte att bara byta argument vid konstruktionen, eftersom
+registeråtkomst, input-invertering och PIO-konfiguration är hårdkodade och
+verifierade för exakt GPIO16/GPIO17.
 
 ## 4. Bind IRQ och skapa host-motorn
 
@@ -569,11 +623,12 @@ transportoberoende protokoll ovanpå `embedded-io-async::Read + Write`.
 
 RP2040-backenden stöder för närvarande:
 
-- en direktansluten full-speed-enhet;
-- endpoint zero control transfers;
-- bulk- och interrupt-endpoints med högst 64 byte;
+- en direktansluten full- eller low-speed-enhet;
+- full-speed endpoint zero, bulk och interrupt med högst 64 byte;
+- low-speed endpoint zero och interrupt med högst 8 byte och minst 10 ms
+  pollingintervall;
 - ingen hubb och inga split transactions;
-- inte low speed, high speed eller isochronous transfers.
+- inte high speed eller isochronous transfers.
 
 `CdcAcmHost` kan konstrueras med 512 bytes intern RX-paketbuffert för en annan
 high-speed-controller. Det ger inte RP2040-backenden high-speed-signalering.

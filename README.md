@@ -3,6 +3,44 @@
 An experimental USB host controller built in Rust with Embassy and the RP2040
 PIO. The project targets the **Adafruit Feather RP2040 with USB Type A Host**.
 
+> **Alpha status:** the CDC-ACM and raw HID class paths have been exercised on
+> hardware and inspected with a Beagle USB 480 analyzer, but the API and the
+> fixed RP2040 resource allocation may still change. This is not yet a
+> production-qualified or drop-in replacement for a general-purpose USB host
+> stack.
+
+## Current hardware contract
+
+The reusable class drivers are controller-independent, but the concrete
+`Rp2040PioEngine` is intentionally fixed to the analyzer-verified resource
+layout below:
+
+| Resource | Current use |
+|---|---|
+| `clk_sys` | exactly 120 MHz |
+| PIO0 SM0 | USB TX; 22 instructions; 48 MHz full speed / 6 MHz low speed |
+| PIO1 SM0 | RX decoder at 120 MHz |
+| PIO1 SM1 | edge/EOP detector; 96 MHz full speed / 12 MHz low speed |
+| PIO1 instruction memory | fully occupied: 15 + 17 = 32 instructions |
+| DMA channel 0 | owned, IRQ-bound, and reserved by the constructor |
+| GPIO16 | USB D+ |
+| GPIO17 | USB D− |
+| PIO0 IRQ 0, PIO1 IRQ 0, DMA IRQ 0 | backend interrupt bindings |
+
+The supplied Feather firmware additionally uses GPIO18 to enable the board's
+current-limited 5 V VBUS switch and GPIO13 for the red status LED. These two
+board-control pins are owned by the application rather than by
+`Rp2040PioEngine`.
+
+Although only three state machines are active, treat both PIO blocks as
+reserved for the firmware lifetime. The current `embassy-rp 0.10.0` ownership
+workaround deliberately forgets the five unused state-machine handles. PIO1's
+two active programs consume all instruction memory. GPIO16 and GPIO17 are
+exact requirements rather than merely an example consecutive pair because
+the backend also accesses their registers directly. The constructor consumes
+both PIO peripherals, DMA channel 0, GPIO16, and GPIO17, and rejects any
+system clock other than 120 MHz.
+
 ## Library and example split
 
 The project is split into a reusable host library and board-level examples:
@@ -70,9 +108,9 @@ analog outputs off), and validates one exact eight-byte interrupt-IN report.
 This complete low-speed path is hardware-verified with a Beagle USB 480 in
 `beagle-p8055-reset.csv`.
 
-The dependency versions are pinned to `embassy-usb-host 0.1.0`,
-`embassy-usb-driver 0.2.2`, `embassy-futures 0.1.2`, and
-`embedded-io-async 0.7.0`.
+The dependency versions are pinned to `embassy-rp 0.10.0`,
+`embassy-usb-host 0.1.0`, `embassy-usb-driver 0.2.2`,
+`embassy-futures 0.1.2`, and `embedded-io-async 0.7.0`.
 
 `CdcAcmHost` is intended for descriptor-compliant CDC-ACM functions rather
 than for one particular modem or BLE product. Product-specific command
@@ -534,7 +572,9 @@ one 500 ms marker blink, a 500 ms pause, and then the short blinks to count:
 | VBUS enable | GPIO18 | Enables the on-board 5 V boost converter |
 | Status LED | GPIO13 | On-board red D13 LED |
 
-The D+ and D- pins must be consecutive, with D+ first.
+The current backend requires exactly GPIO16 for D+ and GPIO17 for D−. Another
+consecutive pin pair is not sufficient because the verified implementation
+also accesses the GPIO16/GPIO17 registers directly.
 
 The Feather provides the USB-A connector, data-line components, 5 V boost
 converter, and resettable fuse on-board. GPIO18 is only the converter's enable
@@ -870,3 +910,18 @@ the slow six-pulse success state.
 The PIO TX/RX timing models are adapted from
 [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB). See
 `THIRD_PARTY_NOTICES.md` for its MIT license.
+
+## License
+
+Except for third-party material identified in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), this project is licensed
+under either of
+
+- Apache License, Version 2.0
+  ([LICENSE-APACHE](LICENSE-APACHE)); or
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless explicitly stated otherwise, contributions intentionally submitted for
+inclusion in this project are licensed under the same terms.
