@@ -30,6 +30,9 @@ pub const DEFAULT_OUT_MESSAGE_CAPACITY: usize = 512;
 const MSGID_DEV_DEP_MSG_OUT: u8 = 1;
 const MSGID_DEV_DEP_MSG_IN: u8 = 2;
 const REQUEST_GET_CAPABILITIES: u8 = 7;
+const REQUEST_REN_CONTROL: u8 = 0xa0;
+const USBTMC_STATUS_SUCCESS: u8 = 1;
+const USB488_CAPABILITY_SIMPLE: u8 = 1 << 1;
 const HEADER_LEN: usize = 12;
 const ATTRIBUTE_EOM: u8 = 1;
 
@@ -254,6 +257,14 @@ pub struct UsbtmcCapabilities {
     pub usb488_device_capabilities: u8,
 }
 
+impl UsbtmcCapabilities {
+    /// Whether the USB488 interface accepts `REN_CONTROL`, `GO_TO_LOCAL`, and
+    /// `LOCAL_LOCKOUT` class requests.
+    pub const fn supports_remote_enable(self) -> bool {
+        self.usb488_interface_capabilities & USB488_CAPABILITY_SIMPLE != 0
+    }
+}
+
 /// Error returned by a USBTMC host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UsbtmcError {
@@ -261,6 +272,7 @@ pub enum UsbtmcError {
     CommandTooLong,
     ResponseBufferTooSmall,
     InvalidCapabilities,
+    InvalidControlStatus,
     InvalidMessage,
     TagMismatch,
 }
@@ -351,6 +363,21 @@ where
             usb488_interface_capabilities: bytes[14],
             usb488_device_capabilities: bytes[15],
         })
+    }
+
+    /// Assert or deassert USB488 Remote Enable.
+    ///
+    /// Call this only when [`UsbtmcCapabilities::supports_remote_enable`]
+    /// reports support. Asserting REN lets USB488 instruments enter remote
+    /// operation when they receive program messages.
+    pub async fn remote_enable(&mut self, enabled: bool) -> Result<(), UsbtmcError> {
+        let setup = build_remote_enable_setup(self.interface.interface_number, enabled);
+        let mut status = [0_u8; 1];
+        let received = self.control.control_in(&setup, &mut status).await?;
+        if received != status.len() || status[0] != USBTMC_STATUS_SUCCESS {
+            return Err(UsbtmcError::InvalidControlStatus);
+        }
+        Ok(())
     }
 
     /// Send one SCPI/program message and request one response message.
@@ -463,6 +490,17 @@ where
     }
 }
 
+fn build_remote_enable_setup(interface_number: u8, enabled: bool) -> [u8; 8] {
+    SetupRequest {
+        request_type: 0xa1,
+        request: REQUEST_REN_CONTROL,
+        value: u16::from(enabled),
+        index: interface_number as u16,
+        length: 1,
+    }
+    .to_bytes()
+}
+
 fn build_request_in(tag: u8, capacity: usize) -> [u8; HEADER_LEN] {
     let mut request = [0_u8; HEADER_LEN];
     request[0] = MSGID_DEV_DEP_MSG_IN;
@@ -496,6 +534,29 @@ mod tests {
         assert_eq!(
             build_request_in(7, 256),
             [2, 7, 0xf8, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn usb488_remote_enable_capability_and_request_are_exact() {
+        let mut capabilities = UsbtmcCapabilities {
+            usbtmc_version_bcd: 0x0100,
+            interface_capabilities: 0,
+            device_capabilities: 0,
+            usb488_version_bcd: 0x0100,
+            usb488_interface_capabilities: 0,
+            usb488_device_capabilities: 0,
+        };
+        assert!(!capabilities.supports_remote_enable());
+        capabilities.usb488_interface_capabilities = USB488_CAPABILITY_SIMPLE;
+        assert!(capabilities.supports_remote_enable());
+        assert_eq!(
+            build_remote_enable_setup(3, true),
+            [0xa1, 0xa0, 1, 0, 3, 0, 1, 0]
+        );
+        assert_eq!(
+            build_remote_enable_setup(3, false),
+            [0xa1, 0xa0, 0, 0, 3, 0, 1, 0]
         );
     }
 }
