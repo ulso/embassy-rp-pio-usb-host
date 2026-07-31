@@ -32,8 +32,8 @@ use crate::LineState;
 use crate::host::{EndpointType, PipeError, Speed, TimeoutConfig};
 use crate::usb::{
     DataToggle, MAX_DECODED_BYTES, PID_ACK, PID_DATA0, PID_DATA1, PID_IN, PID_NAK, PID_OUT,
-    PID_SETUP, PID_STALL, ParsedPacket, REQUEST_SET_ADDRESS, RawDataPacket, SYNC, crc16_data,
-    parse_packet, sof_packet, token_packet,
+    PID_SETUP, PID_STALL, ParsedPacket, RawDataPacket, SYNC, crc16_data, parse_packet, sof_packet,
+    token_packet,
 };
 
 const SYS_CLOCK_HZ: u32 = 120_000_000;
@@ -41,10 +41,6 @@ const USB_TX_PIO_HZ: u32 = 48_000_000;
 const USB_EDGE_PIO_HZ: u32 = 96_000_000;
 const USB_RESET_MS: u64 = 20;
 const USB_RESET_RECOVERY_MS: u64 = 10;
-// `embassy-usb-host` already supplies the USB-mandated 2 ms recovery period.
-// A few bench instruments need a wider margin before accepting the first
-// request at their new address, so bring the total recovery time to 10 ms.
-const SET_ADDRESS_EXTRA_RECOVERY_MS: u64 = 8;
 const RX_IRQ_MASK: u8 = 0b0001_1110;
 const TX_EOP_TIMEOUT_US: u64 = 100;
 const FULL_SPEED_TX_EOP_GUARD_CYCLES: u32 = SYS_CLOCK_HZ / 2_000_000;
@@ -1141,15 +1137,6 @@ fn timeout_deadline(timeout: CoreDuration) -> Instant {
     Instant::now() + Duration::from_micros(micros)
 }
 
-fn is_set_address_request(setup: &[u8; 8], data: &[u8]) -> bool {
-    data.is_empty()
-        && setup[0] == 0x00
-        && setup[1] == REQUEST_SET_ADDRESS
-        && setup[3] == 0x00
-        && setup[4..8] == [0x00; 4]
-        && setup[2] <= 0x7f
-}
-
 fn setup_data_packet(setup: &[u8; 8]) -> [u8; 12] {
     let crc = crc16_data(setup);
     [
@@ -1450,12 +1437,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                 .await;
             wait_for_status_frame = true;
             match self.record_bad_response_result(result, BadResponseSite::ControlOutStatus)? {
-                InReceiveResult::Data { len: 0 } => {
-                    if is_set_address_request(setup, data) {
-                        Timer::after_millis(SET_ADDRESS_EXTRA_RECOVERY_MS).await;
-                    }
-                    return Ok(());
-                }
+                InReceiveResult::Data { len: 0 } => return Ok(()),
                 InReceiveResult::Data { .. } | InReceiveResult::InvalidPacket => {
                     self.record_bad_response(BadResponseSite::ControlOutStatus, None);
                     return Err(PipeError::BadResponse);
