@@ -3,14 +3,16 @@
 //! Reusable USB-host building blocks for an RP2040 PIO controller.
 //!
 //! [`cdc_acm`] provides a controller-independent CDC-ACM byte stream and
-//! [`hid`] provides controller-independent raw HID reports over the official
-//! Embassy host-pipe traits re-exported by [`host`]. [`pio_host`] adapts a
+//! [`ftdi`] provides controller-independent FTDI UART streams. [`hid`]
+//! provides controller-independent raw HID reports over the official Embassy
+//! host-pipe traits re-exported by [`host`]. [`pio_host`] adapts a
 //! serialized packet engine to those traits; its target-gated RP2040
 //! implementation supports one directly connected full- or low-speed device.
 //! Product protocols intentionally live above the library, as shown by the
 //! named examples.
 
 pub mod cdc_acm;
+pub mod ftdi;
 pub mod hid;
 pub mod host;
 pub mod pio_host;

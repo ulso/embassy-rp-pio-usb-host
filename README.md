@@ -4,8 +4,9 @@ An experimental USB host controller built in Rust with Embassy and the RP2040
 PIO. The project targets the **Adafruit Feather RP2040 with USB Type A Host**.
 
 > **Alpha status:** the CDC-ACM and raw HID class paths have been exercised on
-> hardware and inspected with a Beagle USB 480 analyzer, but the API and the
-> fixed RP2040 resource allocation may still change. This is not yet a
+> hardware and inspected with a Beagle USB 480 analyzer. The FTDI UART class
+> is unit-tested and awaiting hardware acceptance. The API and the fixed
+> RP2040 resource allocation may still change. This is not yet a
 > production-qualified or drop-in replacement for a general-purpose USB host
 > stack.
 
@@ -62,6 +63,11 @@ project, see
   the published `embassy-usb-driver` host-pipe traits directly, implements
   `embedded-io-async::Read` and `Write`, and retains strict CDC Union
   Functional Descriptor matching for composite devices.
+- `src/ftdi.rs` contains a controller-independent `FtdiHost` for FTDI
+  vendor-specific USB UARTs. It discovers the vendor interface and bulk
+  endpoints, implements UART vendor requests, strips the two status bytes
+  from every bulk-IN packet, and exposes `embedded-io-async::Read` and
+  `Write`. FT232R (`0403:6001`) is the first hardware-acceptance target.
 - `src/hid.rs` contains a controller-independent raw `HidHost`. It performs
   strict HID/report/interrupt-endpoint discovery and exposes raw reports plus
   the standard HID class requests without assuming a keyboard, mouse, report

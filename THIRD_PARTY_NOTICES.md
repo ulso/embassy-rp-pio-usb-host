@@ -26,3 +26,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## ftdi-nusb
+
+The FTDI request encodings, chip identification, and baud-divider
+implementation in `src/ftdi.rs` were developed with reference to ftdi-nusb:
+
+https://github.com/ArthurHeymans/ftdi-nusb
+
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT License
