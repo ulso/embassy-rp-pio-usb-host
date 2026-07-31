@@ -57,6 +57,18 @@ fn next_transaction_delay_ms(target: PipeTarget, retry: bool) -> u64 {
     }
 }
 
+#[cfg(any(target_os = "none", test))]
+const fn checked_control_in_packet_end(
+    received: usize,
+    packet_len: usize,
+    requested: usize,
+) -> Option<usize> {
+    match received.checked_add(packet_len) {
+        Some(end) if end <= requested => Some(end),
+        _ => None,
+    }
+}
+
 /// Immutable metadata carried by one logical host pipe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PipeTarget {
@@ -1902,6 +1914,18 @@ mod tests {
         assert_eq!(next_transaction_delay_ms(interrupt, false), 37);
         assert_eq!(next_transaction_delay_ms(bulk, true), 1);
         assert_eq!(next_transaction_delay_ms(bulk, false), 0);
+    }
+
+    #[test]
+    fn control_in_packet_bounds_are_checked_after_wire_acceptance() {
+        assert_eq!(checked_control_in_packet_end(0, 9, 9), Some(9));
+        assert_eq!(checked_control_in_packet_end(0, 18, 9), None);
+        assert_eq!(checked_control_in_packet_end(64, 6, 70), Some(70));
+        assert_eq!(checked_control_in_packet_end(64, 7, 70), None);
+        assert_eq!(
+            checked_control_in_packet_end(usize::MAX, 1, usize::MAX),
+            None
+        );
     }
 
     #[test]

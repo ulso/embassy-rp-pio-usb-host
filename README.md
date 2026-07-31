@@ -10,6 +10,16 @@ PIO. The project targets the **Adafruit Feather RP2040 with USB Type A Host**.
 > production-qualified or drop-in replacement for a general-purpose USB host
 > stack.
 
+## Known issues
+
+- A Keysight MSO-X 3054A running firmware `02.66.2024012316` has intermittently
+  failed the first complete device-descriptor request after `SET_ADDRESS`.
+  Analyzer captures show a timeout while sending the control SETUP packet at
+  address 1. Retrying enumeration recovers without user intervention and the
+  tested USBTMC command path is stable once the device is ready. Increasing
+  the post-`SET_ADDRESS` recovery interval from 2 ms to 10 ms did not reduce
+  the failure rate, so timing margin alone is not considered the root cause.
+
 ## Current hardware contract
 
 The reusable class drivers are controller-independent, but the concrete
