@@ -65,8 +65,7 @@ queues rather than calling the physical packet engine from both cores.
 
 The project is split into a reusable host library and board-level examples:
 
-For a step-by-step Swedish integration guide for a new Embassy CDC-ACM
-project, see
+For a step-by-step integration guide for a new Embassy CDC-ACM project, see
 [`docs/CDC_ACM_HOST_GUIDE.md`](docs/CDC_ACM_HOST_GUIDE.md).
 
 - `src/cdc_acm.rs` contains a controller-independent `CdcAcmHost`. It uses
