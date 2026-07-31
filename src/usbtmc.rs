@@ -419,19 +419,39 @@ where
             return Err(UsbtmcError::ResponseBufferTooSmall);
         }
 
+        let wire_len = HEADER_LEN + announced.next_multiple_of(4);
+        if first_len > wire_len {
+            return Err(UsbtmcError::InvalidMessage);
+        }
+
         let mut copied = (first_len - HEADER_LEN).min(announced);
+        let mut wire_received = first_len;
         response[..copied].copy_from_slice(&self.packet[HEADER_LEN..HEADER_LEN + copied]);
-        while copied < announced {
+        while wire_received < wire_len {
             let received = self
                 .bulk_in
                 .request_in(&mut self.packet[..packet_size])
                 .await?;
-            if received == 0 {
+            if received == 0 || wire_received + received > wire_len {
                 return Err(UsbtmcError::InvalidMessage);
             }
             let count = received.min(announced - copied);
             response[copied..copied + count].copy_from_slice(&self.packet[..count]);
             copied += count;
+            wire_received += received;
+        }
+
+        // A USB bulk transfer whose framed length is an exact multiple of the
+        // endpoint packet size is terminated by a zero-length packet. Consume
+        // it here so it cannot be mistaken for the next USBTMC response.
+        if wire_len.is_multiple_of(packet_size) {
+            let received = self
+                .bulk_in
+                .request_in(&mut self.packet[..packet_size])
+                .await?;
+            if received != 0 {
+                return Err(UsbtmcError::InvalidMessage);
+            }
         }
         Ok(copied)
     }
