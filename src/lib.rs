@@ -4,8 +4,9 @@
 //!
 //! [`cdc_acm`] provides a controller-independent CDC-ACM byte stream and
 //! [`ftdi`] provides controller-independent FTDI UART streams. [`hid`]
-//! provides controller-independent raw HID reports over the official Embassy
-//! host-pipe traits re-exported by [`host`]. [`pio_host`] adapts a
+//! provides controller-independent raw HID reports and [`usbtmc`] provides
+//! framed test-and-measurement messages over the official Embassy host-pipe
+//! traits re-exported by [`host`]. [`pio_host`] adapts a
 //! serialized packet engine to those traits; its target-gated RP2040
 //! implementation supports one directly connected full- or low-speed device.
 //! Product protocols intentionally live above the library, as shown by the
@@ -17,6 +18,7 @@ pub mod hid;
 pub mod host;
 pub mod pio_host;
 pub mod usb;
+pub mod usbtmc;
 
 /// USB bus state sampled from D+ and D-.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
