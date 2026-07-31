@@ -561,6 +561,13 @@ mod tests {
         0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a, // Interrupt IN.
         0x07, 0x05, 0x01, 0x03, 0x08, 0x00, 0x0a, // Interrupt OUT.
     ];
+    const WISPY1_REPORT_DESCRIPTOR_LEN: usize = 48;
+    const WISPY1_CONFIGURATION: [u8; 34] = [
+        0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x03, 0x80, 0x31, // Configuration.
+        0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00, // HID boot keyboard.
+        0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x30, 0x00, // HID 1.11.
+        0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a, // Interrupt IN.
+    ];
 
     #[derive(Clone)]
     struct FakeAllocator;
@@ -910,6 +917,36 @@ mod tests {
         assert_eq!(output.address, 0x01);
         assert_eq!(output.max_packet_size, 8);
         assert_eq!(output.interval, 10);
+    }
+
+    #[test]
+    fn wispy1_configuration_discovers_feature_report_hid_without_interrupt_out() {
+        let interface = HidInterface::discover(&WISPY1_CONFIGURATION).unwrap();
+        assert_eq!(interface.interface_number, 0);
+        assert_eq!(interface.interface_subclass, 1);
+        assert_eq!(interface.interface_protocol, 1);
+        assert_eq!(interface.hid_version_bcd, 0x0111);
+        assert_eq!(
+            usize::from(interface.report_descriptor_len),
+            WISPY1_REPORT_DESCRIPTOR_LEN
+        );
+        assert_eq!(interface.interrupt_in_endpoint.address, 0x81);
+        assert_eq!(interface.interrupt_in_endpoint.max_packet_size, 8);
+        assert_eq!(interface.interrupt_in_endpoint.interval, 10);
+        assert_eq!(interface.interrupt_out_endpoint, None);
+
+        let split = SplitInfo::new(3, 1, SplitSpeed::Low);
+        let host = allocate_hid_host(
+            &FakeAllocator,
+            &WISPY1_CONFIGURATION,
+            1,
+            8,
+            Some(split),
+        )
+        .unwrap();
+        assert_eq!(host.control_pipe().endpoint.max_packet_size, 8);
+        assert_eq!(host.interrupt_in_pipe().endpoint.interval_ms, 10);
+        assert!(host.interrupt_out_pipe().is_none());
     }
 
     #[test]
