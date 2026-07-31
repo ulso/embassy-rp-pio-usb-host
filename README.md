@@ -41,6 +41,15 @@ the backend also accesses their registers directly. The constructor consumes
 both PIO peripherals, DMA channel 0, GPIO16, and GPIO17, and rejects any
 system clock other than 120 MHz.
 
+The RP2040 backend has short CPU-assisted handoffs between the PIO state
+machines, including the full-speed device-data-to-host-ACK turnaround. Run the
+host manager on a dedicated core, or otherwise guarantee that unrelated
+interrupt and executor load cannot delay these paths. The
+`pico-io-bridge` integration runs PIO/DMA ownership, enumeration, pipe
+scheduling, and class transport on core 1 while networking and application
+logic remain on core 0. Cross-core application traffic should use bounded
+queues rather than calling the physical packet engine from both cores.
+
 ## Library and example split
 
 The project is split into a reusable host library and board-level examples:

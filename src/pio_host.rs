@@ -83,6 +83,162 @@ pub enum TransactionOutcome<T> {
     NoResponse,
 }
 
+/// Maximum number of leading payload bytes retained for an IN-toggle diagnostic.
+pub const IN_DIAGNOSTIC_PAYLOAD_PREFIX_CAPACITY: usize = 8;
+
+/// Most recently observed CRC-valid IN packet with the opposite DATA toggle.
+///
+/// The RP2040 backend records this only after the packet has been ACKed and the
+/// timing-critical receive routine has returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnexpectedToggleDiagnostic {
+    /// DATA0 or DATA1 PID expected by the host pipe.
+    pub expected_pid: u8,
+    /// DATA0 or DATA1 PID decoded from the device packet.
+    pub actual_pid: u8,
+    /// Complete payload length of the duplicate packet.
+    pub payload_len: u8,
+    /// Number of valid bytes in [`Self::payload_prefix`].
+    pub payload_prefix_len: u8,
+    /// Leading duplicate-packet payload bytes, zero-filled after the valid prefix.
+    pub payload_prefix: [u8; IN_DIAGNOSTIC_PAYLOAD_PREFIX_CAPACITY],
+}
+
+/// Cumulative non-control IN diagnostics since the last take or bus reset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InTransactionDiagnostics {
+    /// Number of completed non-control IN wire observations.
+    pub attempt_count: u32,
+    /// Number of expected DATA packets accepted by their logical pipe.
+    pub accepted_data_count: u32,
+    /// Number of CRC-valid wrong-toggle packets that were ACKed and discarded.
+    pub unexpected_toggle_count: u32,
+    /// Number of NAK handshakes returned by the device.
+    pub nak_count: u32,
+    /// Number of attempts in which no valid response began.
+    pub no_response_count: u32,
+    /// Number of invalid packets or STALL handshakes.
+    pub invalid_or_stall_count: u32,
+    /// Number of expected zero-length DATA packets that were ACKed.
+    ///
+    /// ZLPs advance the endpoint toggle but are otherwise invisible to byte
+    /// counters, so retaining this count is important when reconstructing the
+    /// expected DATA0/DATA1 sequence.
+    pub accepted_zlp_count: u32,
+    /// Most recently observed wrong-toggle packet.
+    pub latest_unexpected_toggle: Option<UnexpectedToggleDiagnostic>,
+}
+
+/// Cumulative progress markers for non-control IN pipe requests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InPipeProgressDiagnostics {
+    /// Requests that entered the pipe retry loop.
+    pub starts: u32,
+    /// Requests whose per-pipe transaction deadline was already satisfied.
+    pub deadline_ready: u32,
+    /// Requests that acquired the shared physical packet engine.
+    pub engine_acquired: u32,
+    /// Requests whose engine transaction returned.
+    pub engine_returned: u32,
+    /// Requests whose post-transaction frame service returned.
+    pub service_returned: u32,
+}
+
+#[cfg(target_os = "none")]
+static IN_PIPE_PROGRESS: cortex_m::interrupt::Mutex<RefCell<InPipeProgressDiagnostics>> =
+    cortex_m::interrupt::Mutex::new(RefCell::new(InPipeProgressDiagnostics {
+        starts: 0,
+        deadline_ready: 0,
+        engine_acquired: 0,
+        engine_returned: 0,
+        service_returned: 0,
+    }));
+
+#[cfg(target_os = "none")]
+enum InPipeProgressEvent {
+    Start,
+    DeadlineReady,
+    EngineAcquired,
+    EngineReturned,
+    ServiceReturned,
+}
+
+#[cfg(target_os = "none")]
+fn record_in_pipe_progress(event: InPipeProgressEvent) {
+    cortex_m::interrupt::free(|critical_section| {
+        let mut progress = IN_PIPE_PROGRESS.borrow(critical_section).borrow_mut();
+        let counter = match event {
+            InPipeProgressEvent::Start => &mut progress.starts,
+            InPipeProgressEvent::DeadlineReady => &mut progress.deadline_ready,
+            InPipeProgressEvent::EngineAcquired => &mut progress.engine_acquired,
+            InPipeProgressEvent::EngineReturned => &mut progress.engine_returned,
+            InPipeProgressEvent::ServiceReturned => &mut progress.service_returned,
+        };
+        *counter = counter.wrapping_add(1);
+    });
+}
+
+/// Return non-blocking progress counters for the RP2040 IN pipe path.
+#[cfg(target_os = "none")]
+pub fn snapshot_in_pipe_progress_diagnostics() -> InPipeProgressDiagnostics {
+    cortex_m::interrupt::free(|critical_section| {
+        *IN_PIPE_PROGRESS.borrow(critical_section).borrow()
+    })
+}
+
+#[cfg(target_os = "none")]
+fn reset_in_pipe_progress_diagnostics() {
+    cortex_m::interrupt::free(|critical_section| {
+        *IN_PIPE_PROGRESS.borrow(critical_section).borrow_mut() =
+            InPipeProgressDiagnostics::default();
+    });
+}
+
+#[cfg(any(test, target_os = "none"))]
+impl InTransactionDiagnostics {
+    fn record_attempt(&mut self) {
+        self.attempt_count = self.attempt_count.saturating_add(1);
+    }
+
+    fn record_accepted_data(&mut self) {
+        self.accepted_data_count = self.accepted_data_count.saturating_add(1);
+    }
+
+    fn record_nak(&mut self) {
+        self.nak_count = self.nak_count.saturating_add(1);
+    }
+
+    fn record_no_response(&mut self) {
+        self.no_response_count = self.no_response_count.saturating_add(1);
+    }
+
+    fn record_invalid_or_stall(&mut self) {
+        self.invalid_or_stall_count = self.invalid_or_stall_count.saturating_add(1);
+    }
+
+    fn record_accepted_zlp(&mut self) {
+        self.accepted_zlp_count = self.accepted_zlp_count.saturating_add(1);
+    }
+
+    fn record_unexpected_toggle(&mut self, expected_pid: u8, actual_pid: u8, payload: &[u8]) {
+        let prefix_len = payload.len().min(IN_DIAGNOSTIC_PAYLOAD_PREFIX_CAPACITY);
+        let mut payload_prefix = [0; IN_DIAGNOSTIC_PAYLOAD_PREFIX_CAPACITY];
+        payload_prefix[..prefix_len].copy_from_slice(&payload[..prefix_len]);
+        self.unexpected_toggle_count = self.unexpected_toggle_count.saturating_add(1);
+        self.latest_unexpected_toggle = Some(UnexpectedToggleDiagnostic {
+            expected_pid,
+            actual_pid,
+            payload_len: payload.len() as u8,
+            payload_prefix_len: prefix_len as u8,
+            payload_prefix,
+        });
+    }
+
+    fn take(&mut self) -> Self {
+        core::mem::take(self)
+    }
+}
+
 /// The packet-transfer contract implemented by the timing-critical PIO layer.
 ///
 /// The adapter serialises individual wire transactions through one async
@@ -449,6 +605,8 @@ impl<E> PioHostState<E> {
     }
 
     fn mark_bus_reset(&self) {
+        #[cfg(target_os = "none")]
+        reset_in_pipe_progress_diagnostics();
         self.shared.lock(|shared| {
             let mut shared = shared.borrow_mut();
             shared.port = shared.port.after_bus_reset();
@@ -707,7 +865,9 @@ impl<E, T: pipe::Type, D: pipe::Direction> PioHostPipe<'_, E, T, D> {
 
     async fn wait_until_transaction_due(&self) {
         #[cfg(target_os = "none")]
-        embassy_time::Timer::at(self.next_transaction).await;
+        if self.next_transaction > embassy_time::Instant::now() {
+            embassy_time::Timer::at(self.next_transaction).await;
+        }
     }
 
     fn schedule_after_attempt(&mut self, retry: bool) {
@@ -727,14 +887,24 @@ impl<E, T: pipe::Type, D: pipe::Direction> PioHostPipe<'_, E, T, D> {
     {
         let mut no_response_count = 0_u16;
         loop {
+            #[cfg(target_os = "none")]
+            record_in_pipe_progress(InPipeProgressEvent::Start);
             self.wait_until_transaction_due().await;
+            #[cfg(target_os = "none")]
+            record_in_pipe_progress(InPipeProgressEvent::DeadlineReady);
             self.check_valid()?;
             let mut engine = self.state.engine.lock().await;
+            #[cfg(target_os = "none")]
+            record_in_pipe_progress(InPipeProgressEvent::EngineAcquired);
             self.check_valid()?;
             let result = engine
                 .request_in_once(self.target, &mut self.data_toggle, buffer)
                 .await;
+            #[cfg(target_os = "none")]
+            record_in_pipe_progress(InPipeProgressEvent::EngineReturned);
             let _ = engine.service_frame().await;
+            #[cfg(target_os = "none")]
+            record_in_pipe_progress(InPipeProgressEvent::ServiceReturned);
             drop(engine);
             self.check_valid()?;
             let outcome = result?;
@@ -749,6 +919,10 @@ impl<E, T: pipe::Type, D: pipe::Direction> PioHostPipe<'_, E, T, D> {
                 }
                 TransactionOutcome::Nak => {
                     no_response_count = 0;
+                    // A successful bulk packet may be followed immediately
+                    // within the same frame, but a NAK must yield until the
+                    // next 1 ms retry slot. Interrupt endpoints retain their
+                    // descriptor interval through next_transaction_delay_ms.
                     self.schedule_after_attempt(true);
                 }
                 TransactionOutcome::NoResponse => {
@@ -1743,5 +1917,78 @@ mod tests {
         assert_eq!(block_on(output.request_out(b"x", false)), Ok(()));
         assert_eq!(output.data_toggle, DataToggle::Data1);
         assert_eq!(state.engine.try_lock().unwrap().frames, 1);
+    }
+
+    #[test]
+    fn in_transaction_diagnostics_retain_counts_and_latest_prefix() {
+        let mut diagnostics = InTransactionDiagnostics::default();
+
+        diagnostics.record_attempt();
+        diagnostics.record_accepted_data();
+        diagnostics.record_accepted_zlp();
+        diagnostics.record_attempt();
+        diagnostics.record_accepted_data();
+        diagnostics.record_accepted_zlp();
+        diagnostics.record_attempt();
+        diagnostics.record_unexpected_toggle(
+            crate::usb::PID_DATA1,
+            crate::usb::PID_DATA0,
+            b"0123456789",
+        );
+        diagnostics.record_attempt();
+        diagnostics.record_unexpected_toggle(crate::usb::PID_DATA0, crate::usb::PID_DATA1, b"AT");
+        diagnostics.record_attempt();
+        diagnostics.record_nak();
+        diagnostics.record_attempt();
+        diagnostics.record_no_response();
+        diagnostics.record_attempt();
+        diagnostics.record_invalid_or_stall();
+
+        assert_eq!(diagnostics.attempt_count, 7);
+        assert_eq!(diagnostics.accepted_data_count, 2);
+        assert_eq!(diagnostics.accepted_zlp_count, 2);
+        assert_eq!(diagnostics.unexpected_toggle_count, 2);
+        assert_eq!(diagnostics.nak_count, 1);
+        assert_eq!(diagnostics.no_response_count, 1);
+        assert_eq!(diagnostics.invalid_or_stall_count, 1);
+        assert_eq!(
+            diagnostics.attempt_count,
+            diagnostics.accepted_data_count
+                + diagnostics.unexpected_toggle_count
+                + diagnostics.nak_count
+                + diagnostics.no_response_count
+                + diagnostics.invalid_or_stall_count
+        );
+        assert_eq!(
+            diagnostics.latest_unexpected_toggle,
+            Some(UnexpectedToggleDiagnostic {
+                expected_pid: crate::usb::PID_DATA0,
+                actual_pid: crate::usb::PID_DATA1,
+                payload_len: 2,
+                payload_prefix_len: 2,
+                payload_prefix: [b'A', b'T', 0, 0, 0, 0, 0, 0],
+            })
+        );
+    }
+
+    #[test]
+    fn taking_in_transaction_diagnostics_clears_the_accumulator() {
+        let mut diagnostics = InTransactionDiagnostics::default();
+        diagnostics.record_accepted_zlp();
+        diagnostics.record_unexpected_toggle(
+            crate::usb::PID_DATA1,
+            crate::usb::PID_DATA0,
+            b"0123456789",
+        );
+
+        let taken = diagnostics.take();
+
+        assert_eq!(taken.accepted_zlp_count, 1);
+        assert_eq!(taken.unexpected_toggle_count, 1);
+        let latest = taken.latest_unexpected_toggle.unwrap();
+        assert_eq!(latest.payload_len, 10);
+        assert_eq!(latest.payload_prefix_len, 8);
+        assert_eq!(latest.payload_prefix, *b"01234567");
+        assert_eq!(diagnostics, InTransactionDiagnostics::default());
     }
 }

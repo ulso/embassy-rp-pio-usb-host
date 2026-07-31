@@ -25,13 +25,15 @@ use embassy_rp::pio_programs::clock_divider::calculate_pio_clock_divider;
 use embassy_time::{Duration, Instant, Timer};
 use fixed::traits::ToFixed;
 
-use super::{PioHostState, PioPacketEngine, PipeTarget, TransactionOutcome};
+use super::{
+    InTransactionDiagnostics, PioHostState, PioPacketEngine, PipeTarget, TransactionOutcome,
+};
 use crate::LineState;
 use crate::host::{EndpointType, PipeError, Speed, TimeoutConfig};
 use crate::usb::{
-    DataToggle, InDataDisposition, MAX_DECODED_BYTES, PID_ACK, PID_DATA0, PID_DATA1, PID_IN,
-    PID_NAK, PID_OUT, PID_SETUP, PID_STALL, ParsedPacket, RawDataPacket, SYNC, classify_in_data,
-    crc16_data, parse_packet, sof_packet, token_packet,
+    DataToggle, MAX_DECODED_BYTES, PID_ACK, PID_DATA0, PID_DATA1, PID_IN, PID_NAK, PID_OUT,
+    PID_SETUP, PID_STALL, ParsedPacket, RawDataPacket, SYNC, crc16_data, parse_packet, sof_packet,
+    token_packet,
 };
 
 const SYS_CLOCK_HZ: u32 = 120_000_000;
@@ -43,6 +45,8 @@ const RX_IRQ_MASK: u8 = 0b0001_1110;
 const TX_EOP_TIMEOUT_US: u64 = 100;
 const FULL_SPEED_TX_EOP_GUARD_CYCLES: u32 = SYS_CLOCK_HZ / 2_000_000;
 const LOW_SPEED_TX_EOP_GUARD_CYCLES: u32 = SYS_CLOCK_HZ / 333_333;
+// Match Pico-PIO-USB's full-speed path: release ACK as soon as the edge
+// detector has observed EOP and the final CRC bytes have been drained.
 const FULL_SPEED_RX_ACK_EOP_GUARD_CYCLES: u32 = 0;
 const LOW_SPEED_RX_ACK_EOP_GUARD_CYCLES: u32 = SYS_CLOCK_HZ / 500_000;
 const TX_IRQ_POLL_BUDGET: u32 = 100_000;
@@ -50,14 +54,18 @@ const RX_PACKET_POLL_BUDGET: u32 = 20_000;
 const MAX_WIRE_PACKET_BYTES: usize = MAX_DECODED_BYTES;
 const CRC16_USB_RESIDUE: u16 = 0xb001;
 const CONTROL_SETUP_BAD_RESPONSE_RETRY_LIMIT: u8 = 3;
+const CONTROL_SETUP_NO_RESPONSE_RETRY_LIMIT: u8 = 16;
+// `out null, 32`, with no optional side-set. Used only while TX is paused
+// with autopull disabled, to mark a preloaded OSR word as fully consumed.
+const TX_DISCARD_OSR_INSTRUCTION: u16 = 0x6060;
 
 const TX_FULL_SPEED_PROGRAM_IMAGE: [u16; 22] = [
-    0xf445, 0xe083, 0x00ea, 0xa142, 0xd301, 0xa342, 0xb442, 0xe380, 0xc020, 0x0000, 0x6021, 0x002e,
+    0xf445, 0xe083, 0x00ea, 0xa142, 0xd301, 0xa342, 0xb742, 0xe080, 0xc020, 0x0000, 0x6021, 0x002e,
     0x1482, 0xa242, 0xf845, 0x00f1, 0x0104, 0x6021, 0x0035, 0x188f, 0xa242, 0xf445,
 ];
 
 const TX_LOW_SPEED_PROGRAM_IMAGE: [u16; 22] = [
-    0xf845, 0xe083, 0x00ea, 0xa142, 0xd301, 0xa342, 0xb842, 0xe380, 0xc020, 0x0000, 0x6021, 0x002e,
+    0xf845, 0xe083, 0x00ea, 0xa142, 0xd301, 0xa342, 0xbb42, 0xe080, 0xc020, 0x0000, 0x6021, 0x002e,
     0x1882, 0xa242, 0xf445, 0x00f1, 0x0104, 0x6021, 0x0035, 0x148f, 0xa242, 0xf845,
 ];
 
@@ -156,7 +164,7 @@ enum ReceiveResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InReceiveResult {
     Data { len: u8 },
-    UnexpectedToggle,
+    UnexpectedToggle { len: u8 },
     Nak,
     Stall,
     NoResponse,
@@ -236,12 +244,18 @@ impl HandshakeFailure {
     }
 }
 
-/// First `BadResponse` source and any available handshake classification.
+/// First control-transfer failure source and any available handshake
+/// classification.
+///
+/// The historical name is retained for API compatibility, but the diagnostic
+/// also records timeout and transport-error sites.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BadResponseDiagnostic {
     pub site: BadResponseSite,
     pub handshake_failure: Option<HandshakeFailure>,
     pub handshake_observation: Option<HandshakeObservationDiagnostic>,
+    pub setup_attempts: u32,
+    pub setup: [u8; 8],
 }
 
 /// Raw receiver state captured when a handshake packet could not be decoded.
@@ -297,6 +311,9 @@ pub struct Rp2040PioEngine<'d> {
     next_frame: Instant,
     bus_ready_at: Instant,
     first_bad_response: Option<BadResponseDiagnostic>,
+    diagnostic_control_setup: [u8; 8],
+    diagnostic_control_setup_attempts: u32,
+    in_transaction_diagnostics: InTransactionDiagnostics,
 }
 
 impl<'d> Rp2040PioEngine<'d> {
@@ -360,8 +377,11 @@ impl<'d> Rp2040PioEngine<'d> {
             "send_eop:",
             "irq 1 side 0b00 [3]",
             "nop [3]",
-            "nop side 0b01",
-            "set pindirs, 0b00 [3]",
+            // Drive the closing J for one complete USB bit before releasing
+            // the bus, matching Pico-PIO-USB. Moving (rather than adding) the
+            // three delay cycles keeps the complete EOP/park path unchanged.
+            "nop side 0b01 [3]",
+            "set pindirs, 0b00",
             "irq wait 0",
             "jmp start",
             "load_bit1:",
@@ -599,6 +619,9 @@ impl<'d> Rp2040PioEngine<'d> {
             next_frame: Instant::now() + Duration::from_millis(1),
             bus_ready_at: Instant::now(),
             first_bad_response: None,
+            diagnostic_control_setup: [0; 8],
+            diagnostic_control_setup_attempts: 0,
+            in_transaction_diagnostics: InTransactionDiagnostics::default(),
         }
     }
 
@@ -687,6 +710,7 @@ impl<'d> Rp2040PioEngine<'d> {
     async fn reset(&mut self, speed: Speed) -> Result<(), PipeError> {
         self.configure_wire_speed(speed)?;
         self.frame_number = 0;
+        self.in_transaction_diagnostics = InTransactionDiagnostics::default();
         reset_bus(
             &mut self.tx_sm,
             &self.dp,
@@ -700,7 +724,9 @@ impl<'d> Rp2040PioEngine<'d> {
     }
 
     async fn advance_frame(&mut self) -> Result<(), PipeError> {
-        Timer::at(self.bus_ready_at).await;
+        if self.bus_ready_at > Instant::now() {
+            Timer::at(self.bus_ready_at).await;
+        }
         let scheduled_frame = self.next_frame;
         Timer::at(scheduled_frame).await;
         self.transmit_frame_marker().await?;
@@ -790,6 +816,8 @@ impl<'d> Rp2040PioEngine<'d> {
                 site,
                 handshake_failure,
                 handshake_observation: None,
+                setup_attempts: self.diagnostic_control_setup_attempts,
+                setup: self.diagnostic_control_setup,
             });
         }
     }
@@ -804,6 +832,8 @@ impl<'d> Rp2040PioEngine<'d> {
                 site,
                 handshake_failure: Some(classify_handshake_failure(observation)),
                 handshake_observation: Some((*observation).into()),
+                setup_attempts: self.diagnostic_control_setup_attempts,
+                setup: self.diagnostic_control_setup,
             });
         }
     }
@@ -813,10 +843,20 @@ impl<'d> Rp2040PioEngine<'d> {
         result: Result<T, PipeError>,
         site: BadResponseSite,
     ) -> Result<T, PipeError> {
-        if matches!(result, Err(PipeError::BadResponse)) {
+        if result.is_err() {
             self.record_bad_response(site, None);
         }
         result
+    }
+
+    /// Return a non-destructive snapshot of non-control IN diagnostics.
+    pub const fn snapshot_in_transaction_diagnostics(&self) -> InTransactionDiagnostics {
+        self.in_transaction_diagnostics
+    }
+
+    /// Take and clear all accumulated non-control IN diagnostics.
+    pub fn take_in_transaction_diagnostics(&mut self) -> InTransactionDiagnostics {
+        self.in_transaction_diagnostics.take()
     }
 
     fn record_handshake_bad_response_result<T>(
@@ -827,12 +867,15 @@ impl<'d> Rp2040PioEngine<'d> {
     ) -> Result<T, PipeError> {
         if matches!(result, Err(PipeError::BadResponse)) {
             self.record_handshake_bad_response(site, observation);
+        } else if result.is_err() {
+            self.record_bad_response(site, None);
         }
         result
     }
 
     fn recover_tx_state(&mut self) {
         self.tx_sm.set_enable(false);
+        set_tx_autopull(false);
         self.tx_sm.clear_fifos();
         self.tx_irq_flags.clear_all(0b11);
         self.tx_sm.set_pins(Level::Low, &[&self.dp, &self.dm]);
@@ -844,7 +887,13 @@ impl<'d> Rp2040PioEngine<'d> {
         self.tx_sm
             .set_pin_dirs(Direction::In, &[&self.dp, &self.dm]);
         self.tx_sm.restart();
+        // SM_RESTART clears the output shift counter but intentionally
+        // preserves the OSR contents. Consume those stale contents before
+        // restoring autopull, otherwise a failed transaction can prefix the
+        // next packet with an old byte.
+        unsafe { self.tx_sm.exec_instr(TX_DISCARD_OSR_INSTRUCTION) };
         self.tx_sm.clkdiv_restart();
+        set_tx_autopull(true);
         unsafe { self.tx_sm.exec_instr(self.tx_idle_instruction) };
         self.tx_sm.set_enable(true);
     }
@@ -868,7 +917,10 @@ impl<'d> Rp2040PioEngine<'d> {
         observation: &mut RxObservation,
     ) -> Result<(), PipeError> {
         let mut bad_response_attempts = 0_u8;
+        let mut no_response_attempts = 0_u8;
         loop {
+            self.diagnostic_control_setup_attempts =
+                self.diagnostic_control_setup_attempts.wrapping_add(1);
             *observation = RxObservation::default();
             let result = self
                 .out_once(
@@ -883,8 +935,19 @@ impl<'d> Rp2040PioEngine<'d> {
 
             match result {
                 Ok(OutResponse::Ack) => return Ok(()),
-                Ok(OutResponse::Nak | OutResponse::NoResponse) => {
+                Ok(OutResponse::Nak) => {
+                    no_response_attempts = 0;
                     if Instant::now() >= deadline {
+                        self.record_bad_response(site, None);
+                        return Err(PipeError::Timeout);
+                    }
+                }
+                Ok(OutResponse::NoResponse) => {
+                    no_response_attempts = no_response_attempts.saturating_add(1);
+                    if no_response_attempts >= CONTROL_SETUP_NO_RESPONSE_RETRY_LIMIT
+                        || Instant::now() >= deadline
+                    {
+                        self.record_bad_response(site, None);
                         return Err(PipeError::Timeout);
                     }
                 }
@@ -897,7 +960,10 @@ impl<'d> Rp2040PioEngine<'d> {
                         return Err(PipeError::BadResponse);
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.record_bad_response(site, None);
+                    return Err(error);
+                }
             }
         }
     }
@@ -911,7 +977,9 @@ impl<'d> Rp2040PioEngine<'d> {
         observation: &mut RxObservation,
         frame_scheduled: bool,
     ) -> Result<OutResponse, PipeError> {
-        Timer::at(self.bus_ready_at).await;
+        if self.bus_ready_at > Instant::now() {
+            Timer::at(self.bus_ready_at).await;
+        }
         if frame_scheduled {
             self.wait_transaction_frame(1).await?;
         } else {
@@ -939,14 +1007,20 @@ impl<'d> Rp2040PioEngine<'d> {
             self.rx_reset_instruction,
             self.rx_clear_x_instruction,
         );
-        let transmit_result = transmit_token_data_pair(
-            &mut self.tx_sm,
-            &self.tx_irq_flags,
-            &self.rx_irq_flags,
-            &token,
-            data_packet.as_bytes(),
-            self.profile.tx_eop_guard_cycles,
-        );
+        // A full-speed token-to-data inter-packet gap is shorter than an
+        // ordinary Embassy timer or network interrupt. Keep the complete pair
+        // atomic so IRQ latency cannot stretch the CPU-controlled IRQ0
+        // handoff between the token EOP and DATA0 start.
+        let transmit_result = cortex_m::interrupt::free(|_| {
+            transmit_token_data_pair(
+                &mut self.tx_sm,
+                &self.tx_irq_flags,
+                &self.rx_irq_flags,
+                &token,
+                data_packet.as_bytes(),
+                self.profile.tx_eop_guard_cycles,
+            )
+        });
         if let Err(error) = transmit_result {
             self.rx_sm.set_enable(false);
             self.edge_sm.set_enable(false);
@@ -981,7 +1055,9 @@ impl<'d> Rp2040PioEngine<'d> {
         raw: &mut [u8; MAX_DECODED_BYTES],
         frame_scheduled: bool,
     ) -> Result<InReceiveResult, PipeError> {
-        Timer::at(self.bus_ready_at).await;
+        if self.bus_ready_at > Instant::now() {
+            Timer::at(self.bus_ready_at).await;
+        }
         if frame_scheduled {
             self.wait_transaction_frame(1).await?;
         } else {
@@ -996,6 +1072,10 @@ impl<'d> Rp2040PioEngine<'d> {
         let Some(receive_payload) = payload.get_mut(..receive_capacity) else {
             return Err(PipeError::BufferOverflow);
         };
+        if !matches!(expected_pid, PID_DATA0 | PID_DATA1) || max_payload_len > receive_payload.len()
+        {
+            return Err(PipeError::BadResponse);
+        }
         // See out_once: the edge IRQs must be cleared before RX starts waiting
         // on IRQ4, especially after an independently serviced idle SOF.
         park_receive(
@@ -1118,6 +1198,19 @@ impl<'d> PioHostState<Rp2040PioEngine<'d>> {
     pub async fn take_bad_response_diagnostic(&self) -> Option<BadResponseDiagnostic> {
         self.engine.lock().await.first_bad_response.take()
     }
+
+    /// Return a non-destructive snapshot of non-control IN diagnostics.
+    pub async fn snapshot_in_transaction_diagnostics(&self) -> InTransactionDiagnostics {
+        self.engine
+            .lock()
+            .await
+            .snapshot_in_transaction_diagnostics()
+    }
+
+    /// Take and clear all accumulated non-control IN diagnostics.
+    pub async fn take_in_transaction_diagnostics(&self) -> InTransactionDiagnostics {
+        self.engine.lock().await.take_in_transaction_diagnostics()
+    }
 }
 
 impl PioPacketEngine for Rp2040PioEngine<'_> {
@@ -1137,6 +1230,8 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
         buffer: &mut [u8],
         timeout: TimeoutConfig,
     ) -> Result<usize, PipeError> {
+        self.diagnostic_control_setup = *setup;
+        self.diagnostic_control_setup_attempts = 0;
         if target.endpoint.ep_type != EndpointType::Control
             || target.endpoint.addr.index() != 0
             || setup[0] & 0x80 == 0
@@ -1189,7 +1284,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                     .await;
                 match self.record_bad_response_result(result, BadResponseSite::ControlInData)? {
                     InReceiveResult::Data { len } => break len as usize,
-                    InReceiveResult::UnexpectedToggle | InReceiveResult::Nak => {}
+                    InReceiveResult::UnexpectedToggle { .. } | InReceiveResult::Nak => {}
                     InReceiveResult::Stall => return Err(PipeError::Stall),
                     InReceiveResult::NoResponse => {}
                     InReceiveResult::InvalidPacket => {
@@ -1198,6 +1293,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                     }
                 }
                 if Instant::now() >= deadline {
+                    self.record_bad_response(BadResponseSite::ControlInData, None);
                     return Err(PipeError::Timeout);
                 }
             };
@@ -1236,6 +1332,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                 OutResponse::Ack => return Ok(received),
                 OutResponse::Nak | OutResponse::NoResponse => {
                     if Instant::now() >= deadline {
+                        self.record_bad_response(BadResponseSite::ControlInStatus, None);
                         return Err(PipeError::Timeout);
                     }
                     self.schedule_retry_frame_from_now();
@@ -1251,6 +1348,8 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
         data: &[u8],
         timeout: TimeoutConfig,
     ) -> Result<(), PipeError> {
+        self.diagnostic_control_setup = *setup;
+        self.diagnostic_control_setup_attempts = 0;
         if target.endpoint.ep_type != EndpointType::Control
             || target.endpoint.addr.index() != 0
             || setup[0] & 0x80 != 0
@@ -1305,6 +1404,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                     }
                     OutResponse::Nak | OutResponse::NoResponse => {
                         if Instant::now() >= deadline {
+                            self.record_bad_response(BadResponseSite::ControlOutData, None);
                             return Err(PipeError::Timeout);
                         }
                     }
@@ -1334,11 +1434,12 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                     self.record_bad_response(BadResponseSite::ControlOutStatus, None);
                     return Err(PipeError::BadResponse);
                 }
-                InReceiveResult::UnexpectedToggle | InReceiveResult::Nak => {}
+                InReceiveResult::UnexpectedToggle { .. } | InReceiveResult::Nak => {}
                 InReceiveResult::Stall => return Err(PipeError::Stall),
                 InReceiveResult::NoResponse => {}
             }
             if Instant::now() >= deadline {
+                self.record_bad_response(BadResponseSite::ControlOutStatus, None);
                 return Err(PipeError::Timeout);
             }
             self.schedule_retry_frame_from_now();
@@ -1360,19 +1461,29 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
         }
         let mut packet = [0_u8; 64];
         let mut raw = [0_u8; MAX_DECODED_BYTES];
-        match self
+        let expected_pid = data_toggle.pid();
+        let response = self
             .in_once(
                 target,
-                data_toggle.pid(),
+                expected_pid,
                 buffer.len().min(target.endpoint.max_packet_size as usize),
                 &mut packet,
                 &mut raw,
+                // Service an overdue SOF before the transaction, but permit
+                // another successful bulk packet in the current frame. The
+                // adapter delays NAK/no-response retries by 1 ms, while
+                // interrupt pipes retain their descriptor interval.
                 false,
             )
-            .await?
-        {
+            .await?;
+        self.in_transaction_diagnostics.record_attempt();
+        match response {
             InReceiveResult::Data { len } => {
+                self.in_transaction_diagnostics.record_accepted_data();
                 let len = len as usize;
+                if len == 0 {
+                    self.in_transaction_diagnostics.record_accepted_zlp();
+                }
                 *data_toggle = data_toggle.after_ack();
                 if len > buffer.len() {
                     return Err(PipeError::BufferOverflow);
@@ -1380,10 +1491,31 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                 buffer[..len].copy_from_slice(&packet[..len]);
                 Ok(TransactionOutcome::Complete(len))
             }
-            InReceiveResult::UnexpectedToggle | InReceiveResult::Nak => Ok(TransactionOutcome::Nak),
-            InReceiveResult::Stall => Err(PipeError::Stall),
-            InReceiveResult::NoResponse => Ok(TransactionOutcome::NoResponse),
-            InReceiveResult::InvalidPacket => Err(PipeError::BadResponse),
+            InReceiveResult::UnexpectedToggle { len } => {
+                let payload_len = usize::from(len);
+                self.in_transaction_diagnostics.record_unexpected_toggle(
+                    expected_pid,
+                    raw[1],
+                    &raw[2..2 + payload_len],
+                );
+                Ok(TransactionOutcome::Nak)
+            }
+            InReceiveResult::Nak => {
+                self.in_transaction_diagnostics.record_nak();
+                Ok(TransactionOutcome::Nak)
+            }
+            InReceiveResult::Stall => {
+                self.in_transaction_diagnostics.record_invalid_or_stall();
+                Err(PipeError::Stall)
+            }
+            InReceiveResult::NoResponse => {
+                self.in_transaction_diagnostics.record_no_response();
+                Ok(TransactionOutcome::NoResponse)
+            }
+            InReceiveResult::InvalidPacket => {
+                self.in_transaction_diagnostics.record_invalid_or_stall();
+                Err(PipeError::BadResponse)
+            }
         }
     }
 
@@ -1682,12 +1814,91 @@ fn crc16_update_ram(crc: u16, byte: u8) -> u16 {
 }
 
 #[inline(always)]
+fn set_tx_autopull(enabled: bool) {
+    pac::PIO0
+        .sm(0)
+        .shiftctrl()
+        .modify(|w| w.set_autopull(enabled));
+}
+
+#[inline(always)]
+fn discard_preloaded_ack(tx_sm: &mut StateMachine<'_, PIO0, 0>) {
+    // The pending automatic pull normally leaves ACK SYNC in the OSR and ACK
+    // PID in the FIFO while TX waits on IRQ0. Flush both without changing the
+    // parked program counter. This cold path is used for NAK/invalid replies;
+    // valid DATA can release the already prepared ACK with one IRQ write.
+    set_tx_autopull(false);
+    tx_sm.clear_fifos();
+    tx_sm.set_enable(false);
+    unsafe { tx_sm.exec_instr(TX_DISCARD_OSR_INSTRUCTION) };
+    tx_sm.set_enable(true);
+    set_tx_autopull(true);
+}
+
+#[inline(always)]
 fn drain_in_fifo(
     sm: &mut StateMachine<'_, PIO1, 0>,
     raw: &mut [u8; MAX_DECODED_BYTES],
     len: &mut usize,
     crc: &mut u16,
+    expected_pid: u8,
+    max_expected_payload_len: usize,
+    max_receive_payload_len: usize,
+    header_flags: &mut u8,
+    pid: &mut u8,
+    ack_wire_len_limit: &mut usize,
+    ackable: &mut bool,
 ) {
+    while let Some(word) = sm.rx().try_pull() {
+        let byte = (word >> 24) as u8;
+        if *len < raw.len() {
+            raw[*len] = byte;
+        }
+        if *len < 2 {
+            if *len == 0 {
+                *header_flags = u8::from(byte == SYNC);
+            } else {
+                *pid = byte;
+                if (byte >> 4) == ((!byte) & 0x0f) {
+                    *header_flags |= 1 << 1;
+                }
+                if matches!(byte, PID_DATA0 | PID_DATA1) {
+                    *header_flags |= 1 << 2;
+                }
+                if byte == expected_pid {
+                    *header_flags |= 1 << 3;
+                }
+                if *header_flags & 0b0111 == 0b0111 {
+                    let payload_limit = if byte == expected_pid {
+                        max_expected_payload_len
+                    } else {
+                        max_receive_payload_len
+                    };
+                    *ack_wire_len_limit = payload_limit + 4;
+                }
+            }
+        } else {
+            *crc = crc16_update_ram(*crc, byte);
+            let wire_len = *len + 1;
+            *ackable =
+                wire_len >= 4 && wire_len <= *ack_wire_len_limit && *crc == CRC16_USB_RESIDUE;
+        }
+        *len += 1;
+    }
+}
+
+#[inline(always)]
+fn drain_terminal_data_fifo(
+    sm: &mut StateMachine<'_, PIO1, 0>,
+    raw: &mut [u8; MAX_DECODED_BYTES],
+    len: &mut usize,
+    crc: &mut u16,
+    ack_wire_len_limit: usize,
+) -> bool {
+    // The DATA header was already validated and its ACK preloaded while the
+    // packet was on the wire. At EOP only the trailing payload/CRC bytes can
+    // remain, so avoid repeating PID, toggle and length classification for
+    // every terminal byte on the full-speed turnaround path.
     while let Some(word) = sm.rx().try_pull() {
         let byte = (word >> 24) as u8;
         if *len < raw.len() {
@@ -1697,6 +1908,22 @@ fn drain_in_fifo(
             *crc = crc16_update_ram(*crc, byte);
         }
         *len += 1;
+    }
+
+    *len >= 4 && *len <= ack_wire_len_limit && *crc == CRC16_USB_RESIDUE
+}
+
+#[cold]
+#[inline(never)]
+fn classify_unacknowledged_in_packet(len: usize, header_flags: u8, pid: u8) -> InReceiveResult {
+    if len == 2 && header_flags & 0b0011 == 0b0011 {
+        match pid {
+            PID_NAK => InReceiveResult::Nak,
+            PID_STALL => InReceiveResult::Stall,
+            _ => InReceiveResult::InvalidPacket,
+        }
+    } else {
+        InReceiveResult::InvalidPacket
     }
 }
 
@@ -1753,9 +1980,9 @@ fn transmit_token_data_pair(
 
 /// Send an IN token, receive one device response, and ACK valid DATA in time.
 ///
-/// The ACK is placed in the TX FIFO while the token is still in EOP, but the
-/// TX state machine remains parked on IRQ0 until the device packet has passed
-/// its PID and streaming CRC checks. The complete critical path stays in SRAM.
+/// The ACK is placed in the TX FIFO after a valid DATA PID, but the TX state
+/// machine remains parked on IRQ0 until the device packet has passed its
+/// streaming CRC checks. The complete critical path stays in SRAM.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 #[unsafe(link_section = ".data.ram_func")]
@@ -1782,12 +2009,7 @@ fn receive_data_packet(
     // Arm the parked edge detector at the beginning of the IN token's EOP.
     rx_irq_flags.clear_all(RX_IRQ_MASK);
 
-    // The token can no longer consume FIFO data after entering EOP. Queue the
-    // host ACK now, then leave IRQ0 asserted so it cannot start prematurely.
-    tx_sm.tx().push(u32::from(SYNC) * 0x0101_0101);
-    tx_sm.tx().push(u32::from(PID_ACK) * 0x0101_0101);
     if let Err(error) = wait_for_tx_irq(tx_irq_flags, 0) {
-        tx_sm.clear_fifos();
         return Err(error);
     }
 
@@ -1795,94 +2017,172 @@ fn receive_data_packet(
     let mut crc = 0xffff_u16;
     let mut budget = RX_PACKET_POLL_BUDGET;
     let mut saw_start = false;
-    let mut saw_eop = false;
-    let mut rx_error = false;
-
+    let mut header_flags = 0_u8;
+    let mut pid = 0_u8;
+    let mut ack_wire_len_limit = 0_usize;
+    let mut ackable = false;
+    let mut ack_preloaded = false;
+    let mut ack_released = false;
     loop {
-        drain_in_fifo(rx_sm, raw, &mut len, &mut crc);
+        // A full-speed packet whose final CRC byte was consumed on the
+        // previous polling pass can bypass the general loop bookkeeping.
+        // Observe EOP, wait past its earliest detector phase, then perform one
+        // terminal FIFO drain and revalidate CRC/length before releasing ACK.
+        // Keep the decoder-error checks ahead of both the drain and release,
+        // and retain the guarded path below for low-speed packets.
+        if ack_eop_guard_cycles == 0 && ackable {
+            if rx_irq_flags.check(1) {
+                discard_preloaded_ack(tx_sm);
+                return Ok(InReceiveResult::InvalidPacket);
+            }
+            if rx_irq_flags.check(2) {
+                // The complete packet was validated before EOP. Release the
+                // already prepared ACK immediately.
+                tx_irq_flags.clear(0);
+                ack_released = true;
+                break;
+            }
+        }
+
+        drain_in_fifo(
+            rx_sm,
+            raw,
+            &mut len,
+            &mut crc,
+            expected_pid,
+            max_payload_len,
+            payload.len(),
+            &mut header_flags,
+            &mut pid,
+            &mut ack_wire_len_limit,
+            &mut ackable,
+        );
+        // A DATA PID is known near the beginning of the device packet, leaving
+        // ample wire time to prepare ACK before EOP. Do not preload for NAK or
+        // other handshakes: repeatedly flushing a speculative ACK perturbs the
+        // TX OSR shift count and can occasionally lengthen a later ACK by one
+        // USB bit.
+        if !ack_preloaded && header_flags & 0b0111 == 0b0111 {
+            tx_sm.tx().push(u32::from(SYNC) * 0x0101_0101);
+            tx_sm.tx().push(u32::from(PID_ACK) * 0x0101_0101);
+            ack_preloaded = true;
+        }
         saw_start |= len != 0 || rx_irq_flags.check(3);
 
         if rx_irq_flags.check(1) {
-            rx_error = true;
-            break;
+            // A decoder error can never be ACKed. Remove the preloaded
+            // handshake before returning so it cannot escape on a later
+            // transaction.
+            if ack_preloaded {
+                discard_preloaded_ack(tx_sm);
+            }
+            return Ok(InReceiveResult::InvalidPacket);
         }
         if rx_irq_flags.check(2) {
-            saw_eop = true;
+            // The edge detector and byte decoder are separate state machines.
+            // Even though the decoder normally pushes the final CRC byte
+            // before EOP, the CPU can observe an empty FIFO immediately before
+            // that push and then observe EOP. If streaming validation has not
+            // already completed, drain once more after EOP so the ACK decision
+            // cannot use a stale packet prefix.
+            if ack_eop_guard_cycles != 0 {
+                inline_delay_cycles(ack_eop_guard_cycles);
+            }
+            if !ackable {
+                if ack_preloaded {
+                    ackable = drain_terminal_data_fifo(
+                        rx_sm,
+                        raw,
+                        &mut len,
+                        &mut crc,
+                        ack_wire_len_limit,
+                    );
+                } else {
+                    drain_in_fifo(
+                        rx_sm,
+                        raw,
+                        &mut len,
+                        &mut crc,
+                        expected_pid,
+                        max_payload_len,
+                        payload.len(),
+                        &mut header_flags,
+                        &mut pid,
+                        &mut ack_wire_len_limit,
+                        &mut ackable,
+                    );
+                }
+            }
+            if !ack_preloaded && header_flags & 0b0111 == 0b0111 {
+                tx_sm.tx().push(u32::from(SYNC) * 0x0101_0101);
+                tx_sm.tx().push(u32::from(PID_ACK) * 0x0101_0101);
+                ack_preloaded = true;
+            }
+            // On full-speed packets the terminal FIFO drain may be the first
+            // point at which the trailing CRC byte is visible. Release the
+            // already preloaded ACK here, immediately after CRC validation,
+            // instead of paying the remaining loop-exit and classification
+            // latency before clearing IRQ0.
+            if ack_eop_guard_cycles == 0 && ackable && !ack_released {
+                tx_irq_flags.clear(0);
+                ack_released = true;
+            }
             break;
         }
         if budget == 0 {
-            break;
+            if ack_preloaded {
+                discard_preloaded_ack(tx_sm);
+            }
+            return Ok(if !saw_start && len == 0 {
+                InReceiveResult::NoResponse
+            } else {
+                InReceiveResult::InvalidPacket
+            });
         }
         budget -= 1;
     }
 
-    if saw_eop {
-        // IRQ2 is raised near the beginning of physical EOP. Wait through the
-        // two SE0 bits and J recovery before allowing the host ACK to start.
-        inline_delay_cycles(ack_eop_guard_cycles);
-        drain_in_fifo(rx_sm, raw, &mut len, &mut crc);
-    }
-
-    let pid = raw[1];
-    let valid_pid = (pid >> 4) == ((!pid) & 0x0f);
-    let actual_payload_len = if len >= 4 { len - 4 } else { usize::MAX };
-    let wire_valid_data = !rx_error
-        && saw_eop
-        && raw[0] == SYNC
-        && valid_pid
-        && matches!(pid, PID_DATA0 | PID_DATA1)
-        && crc == CRC16_USB_RESIDUE;
-    let data_disposition = classify_in_data(
-        wire_valid_data,
-        expected_pid,
-        max_payload_len,
-        payload.len(),
-        pid,
-        actual_payload_len,
-    );
-
-    if data_disposition != InDataDisposition::Reject {
-        // ACK an in-range expected packet and every CRC-valid duplicate that
-        // fits the endpoint receive buffer. A duplicate can be longer than the
-        // request's final remaining bytes, so its length limit differs.
-        tx_irq_flags.clear(0);
-        wait_for_tx_irq(tx_irq_flags, 1)?;
-        tx_irq_flags.clear(1);
-        wait_for_tx_irq(tx_irq_flags, 0)?;
-
-        if data_disposition == InDataDisposition::Accept {
-            let mut index = 0;
-            while index < actual_payload_len {
-                // Keep this explicit byte loop inside the SRAM function.
-                // A normal slice copy is lowered to an XIP-flash memcpy shim.
-                unsafe {
-                    let byte = core::ptr::read_volatile(raw.as_ptr().add(index + 2));
-                    core::ptr::write_volatile(payload.as_mut_ptr().add(index), byte);
-                }
-                index += 1;
-            }
-            return Ok(InReceiveResult::Data {
-                len: actual_payload_len as u8,
-            });
+    if !ackable {
+        // A handshake or invalid response must not release the queued ACK on
+        // a later transaction. Keep this cold classification off the valid
+        // DATA packet's turnaround path.
+        if ack_preloaded && !ack_released {
+            discard_preloaded_ack(tx_sm);
         }
-        return Ok(InReceiveResult::UnexpectedToggle);
+        return Ok(classify_unacknowledged_in_packet(len, header_flags, pid));
     }
 
-    // A handshake or invalid response must not release the queued ACK on a
-    // later transaction.
-    tx_sm.clear_fifos();
-
-    if !saw_start && len == 0 {
-        return Ok(InReceiveResult::NoResponse);
+    // Header, PID-dependent length, and streaming CRC were reduced to this
+    // single decision while bytes arrived. Release the preloaded ACK before
+    // doing any result classification or payload copying.
+    debug_assert!(ack_preloaded);
+    if !ack_released {
+        tx_irq_flags.clear(0);
     }
-    if !rx_error && saw_eop && len == 2 && raw[0] == SYNC && valid_pid {
-        return Ok(match pid {
-            PID_NAK => InReceiveResult::Nak,
-            PID_STALL => InReceiveResult::Stall,
-            _ => InReceiveResult::InvalidPacket,
+    wait_for_tx_irq(tx_irq_flags, 1)?;
+    tx_irq_flags.clear(1);
+    wait_for_tx_irq(tx_irq_flags, 0)?;
+
+    let actual_payload_len = len - 4;
+    if header_flags & (1 << 3) == 0 {
+        return Ok(InReceiveResult::UnexpectedToggle {
+            len: actual_payload_len as u8,
         });
     }
-    Ok(InReceiveResult::InvalidPacket)
+
+    let mut index = 0;
+    while index < actual_payload_len {
+        // Keep this explicit byte loop inside the SRAM function.
+        // A normal slice copy is lowered to an XIP-flash memcpy shim.
+        unsafe {
+            let byte = core::ptr::read_volatile(raw.as_ptr().add(index + 2));
+            core::ptr::write_volatile(payload.as_mut_ptr().add(index), byte);
+        }
+        index += 1;
+    }
+    Ok(InReceiveResult::Data {
+        len: actual_payload_len as u8,
+    })
 }
 
 fn prepare_receive(
