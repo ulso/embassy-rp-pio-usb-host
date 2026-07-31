@@ -1836,6 +1836,7 @@ fn discard_preloaded_ack(tx_sm: &mut StateMachine<'_, PIO0, 0>) {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn drain_in_fifo(
     sm: &mut StateMachine<'_, PIO1, 0>,
     raw: &mut [u8; MAX_DECODED_BYTES],
@@ -2009,9 +2010,7 @@ fn receive_data_packet(
     // Arm the parked edge detector at the beginning of the IN token's EOP.
     rx_irq_flags.clear_all(RX_IRQ_MASK);
 
-    if let Err(error) = wait_for_tx_irq(tx_irq_flags, 0) {
-        return Err(error);
-    }
+    wait_for_tx_irq(tx_irq_flags, 0)?;
 
     let mut len = 0_usize;
     let mut crc = 0xffff_u16;
