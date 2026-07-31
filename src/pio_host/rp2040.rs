@@ -1269,14 +1269,12 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
         let max_packet_size = target.endpoint.max_packet_size as usize;
 
         while received < requested {
-            let remaining = requested - received;
-            let expected_len = remaining.min(max_packet_size);
             let packet_len = loop {
                 let result = self
                     .in_once(
                         target,
                         expected.pid(),
-                        expected_len,
+                        max_packet_size,
                         &mut packet,
                         &mut raw,
                         true,
@@ -1298,8 +1296,18 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                 }
             };
 
-            buffer[received..received + packet_len].copy_from_slice(&packet[..packet_len]);
-            received += packet_len;
+            // Validate and ACK a complete CRC-correct endpoint-zero packet at
+            // its advertised packet size, then enforce wLength here. Some
+            // instruments can retransmit the preceding control response after
+            // accepting a fresh SETUP. Leaving that valid but overlong packet
+            // unacknowledged wedges endpoint zero across later bus resets.
+            let Some(end) = super::checked_control_in_packet_end(received, packet_len, requested)
+            else {
+                self.record_bad_response(BadResponseSite::ControlInData, None);
+                return Err(PipeError::BadResponse);
+            };
+            buffer[received..end].copy_from_slice(&packet[..packet_len]);
+            received = end;
             expected = expected.after_ack();
             if packet_len < max_packet_size {
                 break;
