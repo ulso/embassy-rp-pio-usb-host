@@ -446,32 +446,39 @@ where
             return Err(UsbtmcError::ResponseBufferTooSmall);
         }
 
-        let wire_len = HEADER_LEN + announced.next_multiple_of(4);
-        if first_len > wire_len {
+        let minimum_wire_len = HEADER_LEN + announced;
+        let maximum_wire_len = HEADER_LEN + announced.next_multiple_of(4);
+        if first_len > maximum_wire_len {
             return Err(UsbtmcError::InvalidMessage);
         }
 
         let mut copied = (first_len - HEADER_LEN).min(announced);
         let mut wire_received = first_len;
+        let mut last_packet_len = first_len;
         response[..copied].copy_from_slice(&self.packet[HEADER_LEN..HEADER_LEN + copied]);
-        while wire_received < wire_len {
+        while copied < announced {
             let received = self
                 .bulk_in
                 .request_in(&mut self.packet[..packet_size])
                 .await?;
-            if received == 0 || wire_received + received > wire_len {
+            if received == 0 || wire_received + received > maximum_wire_len {
                 return Err(UsbtmcError::InvalidMessage);
             }
             let count = received.min(announced - copied);
             response[copied..copied + count].copy_from_slice(&self.packet[..count]);
             copied += count;
             wire_received += received;
+            last_packet_len = received;
+        }
+        if wire_received < minimum_wire_len {
+            return Err(UsbtmcError::InvalidMessage);
         }
 
-        // A USB bulk transfer whose framed length is an exact multiple of the
-        // endpoint packet size is terminated by a zero-length packet. Consume
-        // it here so it cannot be mistaken for the next USBTMC response.
-        if wire_len.is_multiple_of(packet_size) {
+        // USBTMC allows up to three alignment bytes after the announced data,
+        // but real instruments may terminate the USB transfer with a short
+        // packet immediately after the payload instead. Only a full final
+        // packet needs a following ZLP to mark the transaction boundary.
+        if last_packet_len == packet_size {
             let received = self
                 .bulk_in
                 .request_in(&mut self.packet[..packet_size])
@@ -512,12 +519,154 @@ fn build_request_in(tag: u8, capacity: usize) -> [u8; HEADER_LEN] {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
     use super::*;
 
     const KEYSIGHT_34450A_CONFIGURATION: &[u8] = &[
         9, 2, 39, 0, 1, 1, 0, 0xc0, 50, 9, 4, 0, 0, 3, 0xfe, 3, 1, 0, 7, 5, 1, 2, 64, 0, 1, 7, 5,
         0x82, 2, 64, 0, 1, 7, 5, 0x84, 3, 8, 0, 1,
     ];
+
+    struct FakeControl;
+
+    impl UsbPipe<pipe::Control, pipe::InOut> for FakeControl {
+        async fn control_in(
+            &mut self,
+            _setup: &[u8; 8],
+            _buffer: &mut [u8],
+        ) -> Result<usize, PipeError> {
+            unreachable!()
+        }
+
+        async fn control_out(&mut self, _setup: &[u8; 8], _data: &[u8]) -> Result<(), PipeError> {
+            unreachable!()
+        }
+
+        async fn request_in(&mut self, _buffer: &mut [u8]) -> Result<usize, PipeError> {
+            unreachable!()
+        }
+
+        async fn request_out(
+            &mut self,
+            _data: &[u8],
+            _ensure_transaction_end: bool,
+        ) -> Result<(), PipeError> {
+            unreachable!()
+        }
+
+        fn set_timeout(&mut self, _timeout: TimeoutConfig) {}
+
+        fn reset_data_toggle(&mut self) {
+            unreachable!()
+        }
+    }
+
+    struct FakeBulkIn {
+        response: [u8; DEFAULT_PACKET_CAPACITY],
+        response_len: usize,
+        calls: usize,
+    }
+
+    impl FakeBulkIn {
+        fn new(response: &[u8]) -> Self {
+            let mut bytes = [0; DEFAULT_PACKET_CAPACITY];
+            bytes[..response.len()].copy_from_slice(response);
+            Self {
+                response: bytes,
+                response_len: response.len(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl UsbPipe<pipe::Bulk, pipe::In> for FakeBulkIn {
+        async fn control_in(
+            &mut self,
+            _setup: &[u8; 8],
+            _buffer: &mut [u8],
+        ) -> Result<usize, PipeError> {
+            unreachable!()
+        }
+
+        async fn control_out(&mut self, _setup: &[u8; 8], _data: &[u8]) -> Result<(), PipeError> {
+            unreachable!()
+        }
+
+        async fn request_in(&mut self, buffer: &mut [u8]) -> Result<usize, PipeError> {
+            assert_eq!(self.calls, 0, "short response must finish in one packet");
+            self.calls += 1;
+            buffer[..self.response_len].copy_from_slice(&self.response[..self.response_len]);
+            Ok(self.response_len)
+        }
+
+        async fn request_out(
+            &mut self,
+            _data: &[u8],
+            _ensure_transaction_end: bool,
+        ) -> Result<(), PipeError> {
+            unreachable!()
+        }
+
+        fn set_timeout(&mut self, _timeout: TimeoutConfig) {
+            unreachable!()
+        }
+
+        fn reset_data_toggle(&mut self) {}
+    }
+
+    struct FakeBulkOut;
+
+    impl UsbPipe<pipe::Bulk, pipe::Out> for FakeBulkOut {
+        async fn control_in(
+            &mut self,
+            _setup: &[u8; 8],
+            _buffer: &mut [u8],
+        ) -> Result<usize, PipeError> {
+            unreachable!()
+        }
+
+        async fn control_out(&mut self, _setup: &[u8; 8], _data: &[u8]) -> Result<(), PipeError> {
+            unreachable!()
+        }
+
+        async fn request_in(&mut self, _buffer: &mut [u8]) -> Result<usize, PipeError> {
+            unreachable!()
+        }
+
+        async fn request_out(
+            &mut self,
+            _data: &[u8],
+            _ensure_transaction_end: bool,
+        ) -> Result<(), PipeError> {
+            unreachable!()
+        }
+
+        fn set_timeout(&mut self, _timeout: TimeoutConfig) {
+            unreachable!()
+        }
+
+        fn reset_data_toggle(&mut self) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw_waker(), |_| {}, |_| {}, |_| {});
+
+        const fn raw_waker() -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+
+        // SAFETY: the no-op vtable never dereferences the null data pointer.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("fake pipe futures must complete immediately"),
+        }
+    }
 
     #[test]
     fn discovers_keysight_34450a_interface() {
@@ -558,5 +707,46 @@ mod tests {
             build_remote_enable_setup(3, false),
             [0xa1, 0xa0, 0, 0, 3, 0, 1, 0]
         );
+    }
+
+    #[test]
+    fn accepts_short_response_without_optional_alignment_padding() {
+        let interface = UsbtmcInterface::discover(KEYSIGHT_34450A_CONFIGURATION).unwrap();
+        let packet = [
+            MSGID_DEV_DEP_MSG_IN,
+            4,
+            !4,
+            0,
+            5,
+            0,
+            0,
+            0,
+            ATTRIBUTE_EOM,
+            0,
+            0,
+            0,
+            b'+',
+            b'1',
+            b'2',
+            b'8',
+            b'\n',
+        ];
+        let mut host: UsbtmcHost<
+            FakeControl,
+            FakeBulkIn,
+            FakeBulkOut,
+            DEFAULT_PACKET_CAPACITY,
+            DEFAULT_OUT_MESSAGE_CAPACITY,
+        > = UsbtmcHost::new(
+            interface,
+            FakeControl,
+            FakeBulkIn::new(&packet),
+            FakeBulkOut,
+        );
+        let mut response = [0; 16];
+
+        assert_eq!(block_on(host.read_response(4, &mut response)), Ok(5));
+        assert_eq!(&response[..5], b"+128\n");
+        assert_eq!(host.bulk_in.calls, 1);
     }
 }
