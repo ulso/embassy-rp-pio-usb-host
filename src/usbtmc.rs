@@ -88,9 +88,16 @@ impl UsbtmcInterface {
                 DESCRIPTOR_TYPE_ENDPOINT if current_selected => {
                     let endpoint = parse_endpoint(descriptor)?;
                     match (endpoint.attributes & 0x03, endpoint.is_in()) {
-                        (0x02, true) if bulk_in.replace(endpoint).is_none() => {}
-                        (0x02, false) if bulk_out.replace(endpoint).is_none() => {}
-                        (0x03, true) if interrupt_in.replace(endpoint).is_none() => {}
+                        (0x02, true)
+                            if valid_bulk_packet_size(endpoint.max_packet_size)
+                                && bulk_in.replace(endpoint).is_none() => {}
+                        (0x02, false)
+                            if valid_bulk_packet_size(endpoint.max_packet_size)
+                                && bulk_out.replace(endpoint).is_none() => {}
+                        (0x03, true)
+                            if valid_interrupt_packet_size(endpoint.max_packet_size)
+                                && endpoint.interval != 0
+                                && interrupt_in.replace(endpoint).is_none() => {}
                         _ => {
                             return Err(UsbtmcConfigurationError::InvalidEndpointDescriptor);
                         }
@@ -131,12 +138,19 @@ fn parse_endpoint(bytes: &[u8]) -> Result<EndpointDescriptor, UsbtmcConfiguratio
     if endpoint.address & 0x70 != 0
         || endpoint.number() == 0
         || !matches!(endpoint.attributes & 0x03, 0x02 | 0x03)
-        || !matches!(endpoint.max_packet_size, 8 | 16 | 32 | 64 | 512)
         || raw_max_packet_size & 0xf800 != 0
     {
         return Err(UsbtmcConfigurationError::InvalidEndpointDescriptor);
     }
     Ok(endpoint)
+}
+
+const fn valid_bulk_packet_size(max_packet_size: u16) -> bool {
+    matches!(max_packet_size, 8 | 16 | 32 | 64 | 512)
+}
+
+const fn valid_interrupt_packet_size(max_packet_size: u16) -> bool {
+    max_packet_size >= 2 && max_packet_size <= 1024
 }
 
 /// Error while discovering a USBTMC interface.
@@ -530,6 +544,11 @@ mod tests {
         0x82, 2, 64, 0, 1, 7, 5, 0x84, 3, 8, 0, 1,
     ];
 
+    const KEYSIGHT_MSOX3054A_CONFIGURATION: &[u8] = &[
+        9, 2, 39, 0, 1, 1, 0, 0xc0, 0, 9, 4, 0, 0, 3, 0xfe, 3, 1, 4, 7, 5, 0x02, 2, 64, 0, 0, 7, 5,
+        0x81, 2, 64, 0, 0, 7, 5, 0x83, 3, 2, 0, 1,
+    ];
+
     struct FakeControl;
 
     impl UsbPipe<pipe::Control, pipe::InOut> for FakeControl {
@@ -676,6 +695,29 @@ mod tests {
         assert_eq!(interface.bulk_out_endpoint.address, 0x01);
         assert_eq!(interface.bulk_in_endpoint.address, 0x82);
         assert_eq!(interface.interrupt_in_endpoint.unwrap().address, 0x84);
+    }
+
+    #[test]
+    fn discovers_keysight_msox3054a_two_byte_interrupt_endpoint() {
+        let interface = UsbtmcInterface::discover(KEYSIGHT_MSOX3054A_CONFIGURATION).unwrap();
+        assert_eq!(interface.interface_number, 0);
+        assert!(interface.supports_usb488());
+        assert_eq!(interface.bulk_out_endpoint.address, 0x02);
+        assert_eq!(interface.bulk_in_endpoint.address, 0x81);
+        let interrupt = interface.interrupt_in_endpoint.unwrap();
+        assert_eq!(interrupt.address, 0x83);
+        assert_eq!(interrupt.max_packet_size, 2);
+        assert_eq!(interrupt.interval, 1);
+    }
+
+    #[test]
+    fn rejects_two_byte_bulk_endpoint() {
+        let mut configuration = KEYSIGHT_MSOX3054A_CONFIGURATION.to_vec();
+        configuration[22] = 2;
+        assert_eq!(
+            UsbtmcInterface::discover(&configuration),
+            Err(UsbtmcConfigurationError::InvalidEndpointDescriptor)
+        );
     }
 
     #[test]
