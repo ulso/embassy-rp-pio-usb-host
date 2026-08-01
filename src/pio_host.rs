@@ -783,7 +783,7 @@ fn validate_low_speed_pipe<D: pipe::Direction>(endpoint: &EndpointInfo) -> Resul
         }
         EndpointType::Isochronous => {
             return Err(HostError::Other(
-                "isochronous transfers are not implemented by the RP2040 PIO backend",
+                "isochronous transfers are not valid for low-speed USB devices",
             ));
         }
     }
@@ -820,9 +820,19 @@ fn validate_full_speed_pipe<D: pipe::Direction>(endpoint: &EndpointInfo) -> Resu
             }
         }
         EndpointType::Isochronous => {
-            return Err(HostError::Other(
-                "isochronous transfers are not implemented by the RP2040 PIO backend",
-            ));
+            validate_non_control_direction::<D>(endpoint)?;
+            if !D::is_in() || D::is_out() {
+                return Err(HostError::Other(
+                    "only isochronous IN is implemented by the RP2040 PIO backend",
+                ));
+            }
+            if endpoint.addr.index() == 0
+                || endpoint.max_packet_size == 0
+                || endpoint.max_packet_size > 100
+                || endpoint.interval_ms == 0
+            {
+                return Err(HostError::InvalidDescriptor);
+            }
         }
     }
 
@@ -930,6 +940,9 @@ impl<E, T: pipe::Type, D: pipe::Direction> PioHostPipe<'_, E, T, D> {
                     };
                 }
                 TransactionOutcome::Nak => {
+                    if self.target.endpoint.ep_type == EndpointType::Isochronous {
+                        return Err(PipeError::Timeout);
+                    }
                     no_response_count = 0;
                     // A successful bulk packet may be followed immediately
                     // within the same frame, but a NAK must yield until the
@@ -938,6 +951,9 @@ impl<E, T: pipe::Type, D: pipe::Direction> PioHostPipe<'_, E, T, D> {
                     self.schedule_after_attempt(true);
                 }
                 TransactionOutcome::NoResponse => {
+                    if self.target.endpoint.ep_type == EndpointType::Isochronous {
+                        return Err(PipeError::Timeout);
+                    }
                     no_response_count += 1;
                     if no_response_count >= NON_RESPONSE_RETRY_LIMIT {
                         return Err(PipeError::Timeout);
@@ -1173,7 +1189,7 @@ mod tests {
 
         async fn request_in_once(
             &mut self,
-            _target: PipeTarget,
+            target: PipeTarget,
             data_toggle: &mut DataToggle,
             buffer: &mut [u8],
         ) -> Result<TransactionOutcome<usize>, PipeError> {
@@ -1199,7 +1215,9 @@ mod tests {
                 return Err(PipeError::BufferOverflow);
             }
             buffer[..packet_len].fill(fill);
-            *data_toggle = data_toggle.after_ack();
+            if target.endpoint.ep_type != EndpointType::Isochronous {
+                *data_toggle = data_toggle.after_ack();
+            }
             Ok(TransactionOutcome::Complete(packet_len))
         }
 
@@ -1254,6 +1272,15 @@ mod tests {
             addr: embassy_usb_driver::EndpointAddress::from_parts(3, direction),
             ep_type: EndpointType::Interrupt,
             max_packet_size: 8,
+            interval_ms: 1,
+        }
+    }
+
+    fn isochronous_in_endpoint() -> EndpointInfo {
+        EndpointInfo {
+            addr: embassy_usb_driver::EndpointAddress::from_parts(2, Direction::In),
+            ep_type: EndpointType::Isochronous,
+            max_packet_size: 100,
             interval_ms: 1,
         }
     }
@@ -1579,6 +1606,47 @@ mod tests {
         let engine = state.engine.try_lock().unwrap();
         assert_eq!(engine.in_calls, 1);
         assert_eq!(engine.in_packet_index, 1);
+    }
+
+    #[test]
+    fn full_speed_isochronous_in_accepts_one_packet_without_toggle() {
+        let state = PioHostState::new(FakeEngine {
+            in_packet_lengths: &[96, 96],
+            ..FakeEngine::default()
+        });
+        block_on(state.reset_and_report_connected(Speed::Full)).unwrap();
+        let allocator = state.controller().unwrap().allocator();
+        let mut input = allocator
+            .alloc_pipe::<pipe::Isochronous, pipe::In>(1, &isochronous_in_endpoint(), None)
+            .unwrap();
+        let mut data = [0; 100];
+
+        assert_eq!(block_on(input.request_in(&mut data)), Ok(96));
+        assert_eq!(&data[..96], &[1; 96]);
+        assert_eq!(input.data_toggle, DataToggle::Data0);
+        let engine = state.engine.try_lock().unwrap();
+        assert_eq!(engine.in_calls, 1);
+    }
+
+    #[test]
+    fn isochronous_in_does_not_retry_a_missing_frame() {
+        let state = PioHostState::new(FakeEngine {
+            in_naks: 1,
+            ..FakeEngine::default()
+        });
+        block_on(state.reset_and_report_connected(Speed::Full)).unwrap();
+        let allocator = state.controller().unwrap().allocator();
+        let mut input = allocator
+            .alloc_pipe::<pipe::Isochronous, pipe::In>(1, &isochronous_in_endpoint(), None)
+            .unwrap();
+        let mut data = [0; 100];
+
+        assert_eq!(
+            block_on(input.request_in(&mut data)),
+            Err(PipeError::Timeout)
+        );
+        let engine = state.engine.try_lock().unwrap();
+        assert_eq!(engine.in_calls, 1);
     }
 
     #[test]

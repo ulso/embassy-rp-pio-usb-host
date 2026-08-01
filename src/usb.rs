@@ -78,7 +78,12 @@ pub const CDC_ACM_CAPABILITY_SEND_BREAK: u8 = 0x04;
 pub const MAX_ENCODED_BYTES: usize = 48;
 
 /// Maximum raw packet size for a 64-byte endpoint payload.
-pub const MAX_DECODED_BYTES: usize = 68;
+/// Largest decoded packet retained by the RP2040 backend.
+///
+/// This includes SYNC, PID and CRC16. 104 bytes accommodates one 100-byte
+/// full-speed USB Audio isochronous payload while keeping the timing-critical
+/// receive buffers bounded.
+pub const MAX_DECODED_BYTES: usize = 104;
 
 /// USB device descriptor type.
 pub const DESCRIPTOR_TYPE_DEVICE: u8 = 0x01;
@@ -1798,7 +1803,7 @@ impl CdcAcmDataState {
 }
 
 impl RawDataPacket {
-    /// Build a data packet for a payload of up to 64 bytes.
+    /// Build a data packet that fits in the backend's bounded packet buffer.
     pub fn new(pid: u8, payload: &[u8]) -> Result<Self, DataPacketError> {
         if !matches!(pid, PID_DATA0 | PID_DATA1) {
             return Err(DataPacketError::InvalidPid);
@@ -2581,10 +2586,10 @@ mod tests {
                 .unwrap()
                 .as_bytes()
                 .len(),
-            MAX_DECODED_BYTES
+            68
         );
         assert_eq!(
-            RawDataPacket::new(PID_DATA1, &[0; 65]),
+            RawDataPacket::new(PID_DATA1, &[0; 101]),
             Err(DataPacketError::PayloadTooLong)
         );
     }

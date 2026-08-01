@@ -12,6 +12,7 @@
 //! Product protocols intentionally live above the library, as shown by the
 //! named examples.
 
+pub mod audio;
 pub mod cdc_acm;
 pub mod ftdi;
 pub mod hid;

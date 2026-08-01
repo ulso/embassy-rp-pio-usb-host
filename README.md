@@ -3,9 +3,9 @@
 An experimental USB host controller built in Rust with Embassy and the RP2040
 PIO. The project targets the **Adafruit Feather RP2040 with USB Type A Host**.
 
-> **Alpha status:** the CDC-ACM and raw HID class paths have been exercised on
-> hardware and inspected with a Beagle USB 480 analyzer. The FTDI UART class
-> is unit-tested and awaiting hardware acceptance. The API and the fixed
+> **Alpha status:** CDC-ACM, FTDI UART, raw HID, USBTMC/USB488, and the bounded
+> USB Audio capture path have been exercised on hardware; the timing-critical
+> PIO paths have also been inspected with a Beagle USB 480 analyzer. The API and the fixed
 > RP2040 resource allocation may still change. This is not yet a
 > production-qualified or drop-in replacement for a general-purpose USB host
 > stack.
@@ -81,6 +81,9 @@ For a step-by-step integration guide for a new Embassy CDC-ACM project, see
   strict HID/report/interrupt-endpoint discovery and exposes raw reports plus
   the standard HID class requests without assuming a keyboard, mouse, report
   ID, or product-specific report format.
+- `src/audio.rs` contains a deliberately bounded UAC1 capture helper. It
+  discovers mono 16-bit PCM input at 48 kHz, selects its alternate setting,
+  requests the sample rate, and exposes one isochronous-IN packet per frame.
 - `src/host.rs` is the compatibility boundary for
   `UsbHostController`, `UsbHostAllocator`, and `UsbPipe`.
 - `src/pio_host.rs` implements the official Embassy controller, allocator, and
@@ -140,18 +143,22 @@ The dependency versions are pinned to `embassy-rp 0.10.0`,
 than for one particular modem or BLE product. Product-specific command
 languages, such as BleuIO's AT protocol, belong above its
 `embedded-io-async` byte-stream interface. Devices that use a vendor-specific
-USB protocol, a non-ACM CDC subclass, isochronous endpoints, or a proprietary
-driver are outside that class driver's scope.
+USB protocol, a non-ACM CDC subclass, or a proprietary driver are outside that
+class driver's scope. UAC1 capture is provided separately by `audio`.
 
 The current RP2040 backend supports one directly connected **full-speed or
-low-speed** root device. Full-speed supports endpoint-zero control and
-bulk/interrupt endpoints up to 64 bytes. Low-speed uses a separate 1.5 Mbit/s
+low-speed** root device. Full-speed supports endpoint-zero control,
+bulk/interrupt endpoints up to 64 bytes, and one isochronous-IN endpoint up to
+100 bytes per 1 ms frame. The initial audio helper intentionally accepts only
+mono 16-bit PCM capture at 48 kHz; playback, feedback endpoints, asynchronous
+rate adaptation, and general-purpose isochronous pipes remain out of scope.
+Low-speed uses a separate 1.5 Mbit/s
 PIO profile, low-speed J/K polarity, a standards-compliant 1 ms keep-alive,
 endpoint-zero MPS 8, and interrupt endpoints up to 8 bytes with intervals of
 at least 10 ms. Low-speed reset, keep-alives, EP0 enumeration, HID report
 descriptor retrieval, and eight-byte interrupt OUT/IN are analyzer-verified
-against an original K8055/P8055. The backend does not implement high speed,
-hubs/split transactions, or isochronous transfers. The CDC class can select
+against an original K8055/P8055. The backend does not implement high speed or
+hubs/split transactions. The CDC class can select
 one of several ACM functions in a composite descriptor, follows the CDC Union
 Functional Descriptor, and exposes a packet-boundary-independent async byte
 stream. Its optional interrupt notification endpoint is discovered but not

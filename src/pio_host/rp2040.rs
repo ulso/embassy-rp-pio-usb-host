@@ -1046,14 +1046,16 @@ impl<'d> Rp2040PioEngine<'d> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn in_once(
         &mut self,
         target: PipeTarget,
         expected_pid: u8,
         max_payload_len: usize,
-        payload: &mut [u8; 64],
+        payload: &mut [u8; MAX_DECODED_BYTES - 4],
         raw: &mut [u8; MAX_DECODED_BYTES],
         frame_scheduled: bool,
+        acknowledge: bool,
     ) -> Result<InReceiveResult, PipeError> {
         if self.bus_ready_at > Instant::now() {
             Timer::at(self.bus_ready_at).await;
@@ -1094,7 +1096,7 @@ impl<'d> Rp2040PioEngine<'d> {
         // being received, leaving an otherwise valid packet unacknowledged.
         // Keep only the analyzer-verified token/RX/ACK routine atomic; all
         // frame scheduling and retry waits remain interruptible.
-        let result = cortex_m::interrupt::free(|_| {
+        let mut receive = || {
             receive_data_packet(
                 &mut self.tx_sm,
                 &self.tx_irq_flags,
@@ -1106,8 +1108,18 @@ impl<'d> Rp2040PioEngine<'d> {
                 max_payload_len,
                 expected_pid,
                 self.profile.rx_ack_eop_guard_cycles,
+                acknowledge,
             )
-        });
+        };
+        let result = if acknowledge {
+            // ACKed transfers have a strict device-EOP to host-ACK deadline.
+            cortex_m::interrupt::free(|_| receive())
+        } else {
+            // Isochronous IN has no handshake. Keeping interrupts disabled for
+            // the complete audio packet is unnecessary and can starve other
+            // time-critical work on a continuously polled endpoint.
+            receive()
+        };
         self.rx_sm.set_enable(false);
         self.edge_sm.set_enable(false);
         let response = match result {
@@ -1117,6 +1129,13 @@ impl<'d> Rp2040PioEngine<'d> {
                 return Err(map_tx_error(error));
             }
         };
+        if !acknowledge {
+            // The ordinary IN path releases a preloaded ACK and naturally
+            // returns the TX state machine to its idle program position.
+            // Isochronous IN deliberately emits no handshake, so restore that
+            // same known idle state explicitly before the next SOF.
+            self.recover_tx_state();
+        }
         Ok(response)
     }
 }
@@ -1264,7 +1283,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
 
         let mut received = 0_usize;
         let mut expected = DataToggle::Data1;
-        let mut packet = [0_u8; 64];
+        let mut packet = [0_u8; MAX_DECODED_BYTES - 4];
         let mut raw = [0_u8; MAX_DECODED_BYTES];
         let max_packet_size = target.endpoint.max_packet_size as usize;
 
@@ -1277,6 +1296,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                         max_packet_size,
                         &mut packet,
                         &mut raw,
+                        true,
                         true,
                     )
                     .await;
@@ -1421,7 +1441,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
         }
 
         // Control-OUT status is IN/DATA1 and must be a ZLP.
-        let mut packet = [0_u8; 64];
+        let mut packet = [0_u8; MAX_DECODED_BYTES - 4];
         let mut raw = [0_u8; MAX_DECODED_BYTES];
         let mut wait_for_status_frame = false;
         loop {
@@ -1433,6 +1453,7 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                     &mut packet,
                     &mut raw,
                     wait_for_status_frame,
+                    true,
                 )
                 .await;
             wait_for_status_frame = true;
@@ -1462,14 +1483,19 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
     ) -> Result<TransactionOutcome<usize>, PipeError> {
         if !matches!(
             target.endpoint.ep_type,
-            EndpointType::Bulk | EndpointType::Interrupt
+            EndpointType::Bulk | EndpointType::Interrupt | EndpointType::Isochronous
         ) || !target.endpoint.addr.is_in()
         {
             return Err(PipeError::BadResponse);
         }
-        let mut packet = [0_u8; 64];
+        let mut packet = [0_u8; MAX_DECODED_BYTES - 4];
         let mut raw = [0_u8; MAX_DECODED_BYTES];
-        let expected_pid = data_toggle.pid();
+        let isochronous = target.endpoint.ep_type == EndpointType::Isochronous;
+        let expected_pid = if isochronous {
+            PID_DATA0
+        } else {
+            data_toggle.pid()
+        };
         let response = self
             .in_once(
                 target,
@@ -1481,7 +1507,8 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                 // another successful bulk packet in the current frame. The
                 // adapter delays NAK/no-response retries by 1 ms, while
                 // interrupt pipes retain their descriptor interval.
-                false,
+                isochronous,
+                !isochronous,
             )
             .await?;
         self.in_transaction_diagnostics.record_attempt();
@@ -1492,7 +1519,9 @@ impl PioPacketEngine for Rp2040PioEngine<'_> {
                 if len == 0 {
                     self.in_transaction_diagnostics.record_accepted_zlp();
                 }
-                *data_toggle = data_toggle.after_ack();
+                if !isochronous {
+                    *data_toggle = data_toggle.after_ack();
+                }
                 if len > buffer.len() {
                     return Err(PipeError::BufferOverflow);
                 }
@@ -2006,6 +2035,7 @@ fn receive_data_packet(
     max_payload_len: usize,
     expected_pid: u8,
     ack_eop_guard_cycles: u32,
+    acknowledge: bool,
 ) -> Result<InReceiveResult, TxError> {
     for &byte in token {
         tx_sm.tx().push(u32::from(byte) * 0x0101_0101);
@@ -2037,7 +2067,7 @@ fn receive_data_packet(
         // terminal FIFO drain and revalidate CRC/length before releasing ACK.
         // Keep the decoder-error checks ahead of both the drain and release,
         // and retain the guarded path below for low-speed packets.
-        if ack_eop_guard_cycles == 0 && ackable {
+        if acknowledge && ack_eop_guard_cycles == 0 && ackable {
             if rx_irq_flags.check(1) {
                 discard_preloaded_ack(tx_sm);
                 return Ok(InReceiveResult::InvalidPacket);
@@ -2069,7 +2099,7 @@ fn receive_data_packet(
         // other handshakes: repeatedly flushing a speculative ACK perturbs the
         // TX OSR shift count and can occasionally lengthen a later ACK by one
         // USB bit.
-        if !ack_preloaded && header_flags & 0b0111 == 0b0111 {
+        if acknowledge && !ack_preloaded && header_flags & 0b0111 == 0b0111 {
             tx_sm.tx().push(u32::from(SYNC) * 0x0101_0101);
             tx_sm.tx().push(u32::from(PID_ACK) * 0x0101_0101);
             ack_preloaded = true;
@@ -2120,7 +2150,7 @@ fn receive_data_packet(
                     );
                 }
             }
-            if !ack_preloaded && header_flags & 0b0111 == 0b0111 {
+            if acknowledge && !ack_preloaded && header_flags & 0b0111 == 0b0111 {
                 tx_sm.tx().push(u32::from(SYNC) * 0x0101_0101);
                 tx_sm.tx().push(u32::from(PID_ACK) * 0x0101_0101);
                 ack_preloaded = true;
@@ -2130,7 +2160,7 @@ fn receive_data_packet(
             // already preloaded ACK here, immediately after CRC validation,
             // instead of paying the remaining loop-exit and classification
             // latency before clearing IRQ0.
-            if ack_eop_guard_cycles == 0 && ackable && !ack_released {
+            if acknowledge && ack_eop_guard_cycles == 0 && ackable && !ack_released {
                 tx_irq_flags.clear(0);
                 ack_released = true;
             }
@@ -2162,13 +2192,15 @@ fn receive_data_packet(
     // Header, PID-dependent length, and streaming CRC were reduced to this
     // single decision while bytes arrived. Release the preloaded ACK before
     // doing any result classification or payload copying.
-    debug_assert!(ack_preloaded);
-    if !ack_released {
-        tx_irq_flags.clear(0);
+    if acknowledge {
+        debug_assert!(ack_preloaded);
+        if !ack_released {
+            tx_irq_flags.clear(0);
+        }
+        wait_for_tx_irq(tx_irq_flags, 1)?;
+        tx_irq_flags.clear(1);
+        wait_for_tx_irq(tx_irq_flags, 0)?;
     }
-    wait_for_tx_irq(tx_irq_flags, 1)?;
-    tx_irq_flags.clear(1);
-    wait_for_tx_irq(tx_irq_flags, 0)?;
 
     let actual_payload_len = len - 4;
     if header_flags & (1 << 3) == 0 {
