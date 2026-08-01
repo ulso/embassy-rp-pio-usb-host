@@ -1226,6 +1226,18 @@ impl<'d> PioHostState<Rp2040PioEngine<'d>> {
             .snapshot_in_transaction_diagnostics()
     }
 
+    /// Return diagnostics only when the packet engine is immediately idle.
+    ///
+    /// A root-port line monitor must never wait behind a continuously polled
+    /// isochronous pipe merely to publish optional diagnostics, because doing
+    /// so would also suspend its detach sampling.
+    pub fn try_snapshot_in_transaction_diagnostics(&self) -> Option<InTransactionDiagnostics> {
+        self.engine
+            .try_lock()
+            .ok()
+            .map(|engine| engine.snapshot_in_transaction_diagnostics())
+    }
+
     /// Take and clear all accumulated non-control IN diagnostics.
     pub async fn take_in_transaction_diagnostics(&self) -> InTransactionDiagnostics {
         self.engine.lock().await.take_in_transaction_diagnostics()
