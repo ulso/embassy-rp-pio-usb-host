@@ -936,14 +936,8 @@ mod tests {
         assert_eq!(interface.interrupt_out_endpoint, None);
 
         let split = SplitInfo::new(3, 1, SplitSpeed::Low);
-        let host = allocate_hid_host(
-            &FakeAllocator,
-            &WISPY1_CONFIGURATION,
-            1,
-            8,
-            Some(split),
-        )
-        .unwrap();
+        let host =
+            allocate_hid_host(&FakeAllocator, &WISPY1_CONFIGURATION, 1, 8, Some(split)).unwrap();
         assert_eq!(host.control_pipe().endpoint.max_packet_size, 8);
         assert_eq!(host.interrupt_in_pipe().endpoint.interval_ms, 10);
         assert!(host.interrupt_out_pipe().is_none());
