@@ -1,4 +1,4 @@
-//! Embassy USB-host adapter for a serialised RP2040 PIO packet engine.
+//! Embassy USB-host adapter for a serialised RP PIO packet engine.
 //!
 //! This module establishes the ownership, lifetime and concurrency boundary
 //! needed by [`embassy_usb_driver::host`]. The target-gated `rp2040` module
@@ -29,6 +29,18 @@ use crate::usb::DataToggle;
 
 #[cfg(target_os = "none")]
 pub mod rp2040;
+
+/// RP2350-facing names for the shared RP PIO packet engine.
+#[cfg(all(target_os = "none", feature = "rp235xa"))]
+pub mod rp2350 {
+    pub use super::rp2040::{
+        BadResponseDiagnostic, BadResponseSite, HandshakeFailure, HandshakeObservationDiagnostic,
+        RootLineDiagnostic, root_line_diagnostic, root_line_state, sample_root_line_state,
+    };
+
+    /// RP2350 alias for the shared PIO0/PIO1/DMA0 packet engine.
+    pub type Rp2350PioEngine<'d> = super::rp2040::Rp2040PioEngine<'d>;
+}
 
 const NON_RESPONSE_RETRY_LIMIT: u16 = 128;
 

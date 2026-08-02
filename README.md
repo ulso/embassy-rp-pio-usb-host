@@ -1,7 +1,9 @@
-# Embassy RP2040 PIO USB Host
+# Embassy RP2040/RP2350 PIO USB Host
 
 An experimental USB host controller built in Rust with Embassy and the RP2040
-PIO. The project targets the **Adafruit Feather RP2040 with USB Type A Host**.
+or RP2350 PIO. The analyzer-verified reference target is the **Adafruit Feather
+RP2040 with USB Type A Host**; the same engine can also be configured for
+adjacent D+/D- pins on RP2350.
 
 > **Alpha status:** CDC-ACM, FTDI UART, raw HID, USBTMC/USB488, and the bounded
 > USB Audio capture path have been exercised on hardware; the timing-critical
@@ -12,6 +14,13 @@ PIO. The project targets the **Adafruit Feather RP2040 with USB Type A Host**.
 
 ## Known issues
 
+- The RP2350 compatibility path is experimental. Testing on an early A2
+  Waveshare RP2350-USB-A shows the documented E9 GPIO high-impedance failure:
+  a released USB data pad can remain high and the root port may observe `SE1`.
+  Full-speed CDC-ACM and FTDI operation have worked, but low-speed operation is
+  not supported on that A2 board. Low-speed and USBTMC validation on RP2350 is
+  deferred until A4 silicon, which fixes E9, is available. The analyzer-verified
+  RP2040 paths are unaffected.
 - A Keysight MSO-X 3054A running firmware `02.66.2024012316` has intermittently
   failed the first complete device-descriptor request after `SET_ADDRESS`.
   Analyzer captures show a timeout while sending the control SETUP packet at

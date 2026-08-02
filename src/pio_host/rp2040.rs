@@ -8,6 +8,7 @@
 //! backend; the former monolithic implementation remains a historical
 //! reference.
 
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration as CoreDuration;
 
 use embassy_rp::Peri;
@@ -15,7 +16,7 @@ use embassy_rp::dma::{self, InterruptHandler as DmaInterruptHandler};
 use embassy_rp::gpio::{Drive, Level, Pull, SlewRate};
 use embassy_rp::interrupt::typelevel::Binding;
 use embassy_rp::pac;
-use embassy_rp::peripherals::{DMA_CH0, PIN_16, PIN_17, PIO0, PIO1};
+use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1};
 use embassy_rp::pio::{
     Config as PioConfig, Direction, FifoJoin, Instance as PioInstance,
     InterruptHandler as PioInterruptHandler, IrqFlags, Pin as PioPin, Pio, ShiftDirection,
@@ -58,6 +59,28 @@ const CONTROL_SETUP_NO_RESPONSE_RETRY_LIMIT: u8 = 16;
 // `out null, 32`, with no optional side-set. Used only while TX is paused
 // with autopull disabled, to mark a preloaded OSR word as fully consumed.
 const TX_DISCARD_OSR_INSTRUCTION: u16 = 0x6060;
+
+static ROOT_DP_PIN: AtomicU8 = AtomicU8::new(16);
+static ROOT_DM_PIN: AtomicU8 = AtomicU8::new(17);
+
+const fn replace_field(image: u32, shift: u32, width: u32, value: u8) -> u32 {
+    let mask = ((1_u32 << width) - 1) << shift;
+    (image & !mask) | ((value as u32) << shift)
+}
+
+const fn tx_pinctrl_image(dp_pin: u8) -> u32 {
+    let image = replace_field(0x6820_4210, 0, 5, dp_pin);
+    let image = replace_field(image, 5, 5, dp_pin);
+    replace_field(image, 10, 5, dp_pin)
+}
+
+const fn rx_execctrl_image(image: u32, jmp_pin: u8) -> u32 {
+    replace_field(image, 24, 5, jmp_pin)
+}
+
+const fn rx_pinctrl_image(image: u32, in_base: u8) -> u32 {
+    replace_field(image, 15, 5, in_base)
+}
 
 const TX_FULL_SPEED_PROGRAM_IMAGE: [u16; 22] = [
     0xf445, 0xe083, 0x00ea, 0xa142, 0xd301, 0xa342, 0xb742, 0xe080, 0xc020, 0x0000, 0x6021, 0x002e,
@@ -116,12 +139,22 @@ impl WireProfile {
         handshake_packet_timeout_us: 100,
     };
 
-    const fn for_speed(speed: Speed) -> Option<Self> {
-        match speed {
-            Speed::Full => Some(Self::FULL),
-            Speed::Low => Some(Self::LOW),
-            Speed::High => None,
-        }
+    const fn for_speed(speed: Speed, dp_pin: u8, dm_pin: u8) -> Option<Self> {
+        let mut profile = match speed {
+            Speed::Full => Self::FULL,
+            Speed::Low => Self::LOW,
+            Speed::High => return None,
+        };
+        let (rx_pin, edge_jmp_pin) = match speed {
+            Speed::Full => (dp_pin, dm_pin),
+            Speed::Low => (dm_pin, dp_pin),
+            Speed::High => return None,
+        };
+        profile.rx_execctrl_image = rx_execctrl_image(profile.rx_execctrl_image, rx_pin);
+        profile.rx_pinctrl_image = rx_pinctrl_image(profile.rx_pinctrl_image, rx_pin);
+        profile.edge_execctrl_image = rx_execctrl_image(profile.edge_execctrl_image, edge_jmp_pin);
+        profile.edge_pinctrl_image = rx_pinctrl_image(profile.edge_pinctrl_image, rx_pin);
+        Some(profile)
     }
 }
 
@@ -270,6 +303,21 @@ pub struct HandshakeObservationDiagnostic {
     pub input_override_snapshot: u8,
 }
 
+/// Raw root-port observations used to distinguish pad, SIO and PIO state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RootLineDiagnostic {
+    /// Physical D+/D- bits reported by IO_BANK0 `INFROMPAD`.
+    pub in_from_pad: u8,
+    /// Raw D+/D- bits reported by SIO `GPIO_IN`.
+    pub sio_input: u8,
+    /// D+/D- input-override encodings, two bits per pin.
+    pub input_override: u8,
+    /// PIO0 debug output values for D+/D-.
+    pub pio_output: u8,
+    /// PIO0 debug output-enable values for D+/D-.
+    pub pio_output_enable: u8,
+}
+
 impl From<RxObservation> for HandshakeObservationDiagnostic {
     fn from(observation: RxObservation) -> Self {
         Self {
@@ -287,9 +335,8 @@ impl From<RxObservation> for HandshakeObservationDiagnostic {
 /// Hardware owner for the verified PIO0 TX and PIO1 RX state machines.
 ///
 /// This first backend intentionally fixes the resources to the Feather
-/// RP2040 USB Host wiring: PIO0 SM0 for TX, PIO1 SM0/SM1 for RX, GPIO16/17
-/// for D+/D-, and DMA channel 0. Generalising resource selection is deferred
-/// until after analyzer equivalence has been established.
+/// RP PIO USB host engine using PIO0 SM0 for TX, PIO1 SM0/SM1 for RX and
+/// DMA channel 0. D+ and D- must be adjacent GPIOs, in that order.
 pub struct Rp2040PioEngine<'d> {
     tx_sm: StateMachine<'d, PIO0, 0>,
     rx_sm: StateMachine<'d, PIO1, 0>,
@@ -329,8 +376,8 @@ impl<'d> Rp2040PioEngine<'d> {
         pio0: Peri<'d, PIO0>,
         pio1: Peri<'d, PIO1>,
         dma_ch0: Peri<'d, DMA_CH0>,
-        dp_pin: Peri<'d, PIN_16>,
-        dm_pin: Peri<'d, PIN_17>,
+        dp_pin: Peri<'d, impl embassy_rp::pio::PioPin + 'd>,
+        dm_pin: Peri<'d, impl embassy_rp::pio::PioPin + 'd>,
         pio0_irq: impl Binding<
             <PIO0 as embassy_rp::pio::Instance>::Interrupt,
             PioInterruptHandler<PIO0>,
@@ -347,8 +394,19 @@ impl<'d> Rp2040PioEngine<'d> {
         assert_eq!(
             embassy_rp::clocks::clk_sys_freq(),
             SYS_CLOCK_HZ,
-            "Rp2040PioEngine requires a 120 MHz clk_sys"
+            "PIO USB host requires a 120 MHz clk_sys"
         );
+        let dp_pin_number = dp_pin.pin();
+        let dm_pin_number = dm_pin.pin();
+        assert_eq!(
+            dm_pin_number,
+            dp_pin_number + 1,
+            "PIO USB host requires adjacent D+/D- GPIOs"
+        );
+        ROOT_DP_PIN.store(dp_pin_number, Ordering::Relaxed);
+        ROOT_DM_PIN.store(dm_pin_number, Ordering::Relaxed);
+        let full_profile = WireProfile::for_speed(Speed::Full, dp_pin_number, dm_pin_number)
+            .expect("full-speed wire profile");
         let tx_dma = dma::Channel::new(dma_ch0, dma_irq);
         let mut pio_tx = Pio::new(pio0, pio0_irq);
         let mut pio_rx = Pio::new(pio1, pio1_irq);
@@ -515,7 +573,7 @@ impl<'d> Rp2040PioEngine<'d> {
             hw.shiftctrl()
                 .write_value(pac::pio::regs::SmShiftctrl(0x500e_0000));
             hw.pinctrl()
-                .write_value(pac::pio::regs::SmPinctrl(0x6820_4210));
+                .write_value(pac::pio::regs::SmPinctrl(tx_pinctrl_image(dp_pin_number)));
         }
         tx_sm.clear_fifos();
         tx_sm.restart();
@@ -526,10 +584,10 @@ impl<'d> Rp2040PioEngine<'d> {
         let mut rx_sm = pio_rx.sm0;
         let mut rx_config = PioConfig::default();
         let mut rx_pins = rx_config.get_pins();
-        rx_pins.in_base = 16;
+        rx_pins.in_base = dp_pin_number;
         unsafe { rx_config.set_pins(rx_pins) };
         let mut rx_exec = rx_config.get_exec();
-        rx_exec.jmp_pin = 16;
+        rx_exec.jmp_pin = dp_pin_number;
         unsafe { rx_config.set_exec(rx_exec) };
         rx_config.fifo_join = FifoJoin::RxOnly;
         rx_config.shift_in.direction = ShiftDirection::Right;
@@ -542,11 +600,11 @@ impl<'d> Rp2040PioEngine<'d> {
             hw.clkdiv()
                 .write_value(pac::pio::regs::SmClkdiv(0x0001_0000));
             hw.execctrl()
-                .write_value(pac::pio::regs::SmExecctrl(0x1000_e000));
+                .write_value(pac::pio::regs::SmExecctrl(full_profile.rx_execctrl_image));
             hw.shiftctrl()
                 .write_value(pac::pio::regs::SmShiftctrl(0x808d_0000));
             hw.pinctrl()
-                .write_value(pac::pio::regs::SmPinctrl(0x0008_0000));
+                .write_value(pac::pio::regs::SmPinctrl(full_profile.rx_pinctrl_image));
         }
         rx_sm.set_enable(false);
         unsafe { rx_sm.exec_instr(rx_fill_osr_instruction) };
@@ -554,10 +612,10 @@ impl<'d> Rp2040PioEngine<'d> {
         let mut edge_sm = pio_rx.sm1;
         let mut edge_config = PioConfig::default();
         let mut edge_pins = edge_config.get_pins();
-        edge_pins.in_base = 16;
+        edge_pins.in_base = dp_pin_number;
         unsafe { edge_config.set_pins(edge_pins) };
         let mut edge_exec = edge_config.get_exec();
-        edge_exec.jmp_pin = 17;
+        edge_exec.jmp_pin = dm_pin_number;
         unsafe { edge_config.set_exec(edge_exec) };
         edge_config.shift_in.direction = ShiftDirection::Left;
         edge_config.shift_in.auto_fill = false;
@@ -570,11 +628,11 @@ impl<'d> Rp2040PioEngine<'d> {
             hw.clkdiv()
                 .write_value(pac::pio::regs::SmClkdiv(0x0001_4000));
             hw.execctrl()
-                .write_value(pac::pio::regs::SmExecctrl(0x1101_8900));
+                .write_value(pac::pio::regs::SmExecctrl(full_profile.edge_execctrl_image));
             hw.shiftctrl()
                 .write_value(pac::pio::regs::SmShiftctrl(0x0088_0000));
             hw.pinctrl()
-                .write_value(pac::pio::regs::SmPinctrl(0x0008_0000));
+                .write_value(pac::pio::regs::SmPinctrl(full_profile.edge_pinctrl_image));
         }
         unsafe { edge_sm.exec_instr(edge_start_instruction) };
         edge_sm.set_enable(true);
@@ -614,7 +672,7 @@ impl<'d> Rp2040PioEngine<'d> {
             rx_clear_x_instruction,
             edge_start_instruction,
             edge_reset_instruction,
-            profile: WireProfile::FULL,
+            profile: full_profile,
             frame_number: 0,
             next_frame: Instant::now() + Duration::from_millis(1),
             bus_ready_at: Instant::now(),
@@ -631,7 +689,9 @@ impl<'d> Rp2040PioEngine<'d> {
     }
 
     fn configure_wire_speed(&mut self, speed: Speed) -> Result<(), PipeError> {
-        let Some(profile) = WireProfile::for_speed(speed) else {
+        let dp_pin = ROOT_DP_PIN.load(Ordering::Relaxed);
+        let dm_pin = ROOT_DM_PIN.load(Ordering::Relaxed);
+        let Some(profile) = WireProfile::for_speed(speed, dp_pin, dm_pin) else {
             return Err(PipeError::BadResponse);
         };
         if self.profile.speed == profile.speed {
@@ -1182,9 +1242,31 @@ fn setup_data_packet(setup: &[u8; 8]) -> [u8; 12] {
 /// [`super::PioHostState::report_disconnected_if_not_resetting`] so the
 /// host-driven SE0 during bus reset cannot become a false detach event.
 pub fn root_line_state() -> LineState {
-    let dp = pac::IO_BANK0.gpio(16).status().read().infrompad() as u32;
-    let dm = pac::IO_BANK0.gpio(17).status().read().infrompad() as u32;
+    let dp_pin = ROOT_DP_PIN.load(Ordering::Relaxed) as usize;
+    let dm_pin = ROOT_DM_PIN.load(Ordering::Relaxed) as usize;
+    let dp = pac::IO_BANK0.gpio(dp_pin).status().read().infrompad() as u32;
+    let dm = pac::IO_BANK0.gpio(dm_pin).status().read().infrompad() as u32;
     LineState::from_pio_sample(dp | (dm << 1))
+}
+
+/// Snapshot all root-port input and PIO-output observations without changing
+/// the bus state.
+pub fn root_line_diagnostic() -> RootLineDiagnostic {
+    let dp_pin = ROOT_DP_PIN.load(Ordering::Relaxed) as usize;
+    let dm_pin = ROOT_DM_PIN.load(Ordering::Relaxed) as usize;
+    let dp_status = pac::IO_BANK0.gpio(dp_pin).status().read();
+    let dm_status = pac::IO_BANK0.gpio(dm_pin).status().read();
+    let pair = |bits: u32| (((bits >> dp_pin) & 1) | (((bits >> dm_pin) & 1) << 1)) as u8;
+    let dp_inover = pac::IO_BANK0.gpio(dp_pin).ctrl().read().inover().to_bits();
+    let dm_inover = pac::IO_BANK0.gpio(dm_pin).ctrl().read().inover().to_bits();
+
+    RootLineDiagnostic {
+        in_from_pad: dp_status.infrompad() as u8 | ((dm_status.infrompad() as u8) << 1),
+        sio_input: pair(pac::SIO.gpio_in(0).read()),
+        input_override: dp_inover | (dm_inover << 2),
+        pio_output: pair(pac::PIO0.dbg_padout().read()),
+        pio_output_enable: pair(pac::PIO0.dbg_padoe().read()),
+    }
 }
 
 /// Backwards-compatible descriptive alias for [`root_line_state`].
@@ -1620,16 +1702,20 @@ fn record_rx_observation(
     observation.bytes = *bytes;
     observation.program_counter = sm.get_addr();
     observation.edge_program_counter = edge_sm.get_addr();
-    let dp_status = pac::IO_BANK0.gpio(16).status().read();
-    let dm_status = pac::IO_BANK0.gpio(17).status().read();
-    let dp_peripheral = dp_status.intoperi() as u8;
-    let dm_peripheral = dm_status.intoperi() as u8;
+    let dp_pin = ROOT_DP_PIN.load(Ordering::Relaxed) as usize;
+    let dm_pin = ROOT_DM_PIN.load(Ordering::Relaxed) as usize;
+    let dp_status = pac::IO_BANK0.gpio(dp_pin).status().read();
+    let dm_status = pac::IO_BANK0.gpio(dm_pin).status().read();
     let dp_pad = dp_status.infrompad() as u8;
     let dm_pad = dm_status.infrompad() as u8;
+    #[cfg(feature = "rp2040")]
+    let (dp_peripheral, dm_peripheral) = (dp_status.intoperi() as u8, dm_status.intoperi() as u8);
+    #[cfg(feature = "rp235xa")]
+    let (dp_peripheral, dm_peripheral) = (dp_pad, dm_pad);
     observation.input_snapshot =
         dp_peripheral | (dm_peripheral << 1) | (dp_pad << 4) | (dm_pad << 5);
-    let dp_inover = pac::IO_BANK0.gpio(16).ctrl().read().inover().to_bits();
-    let dm_inover = pac::IO_BANK0.gpio(17).ctrl().read().inover().to_bits();
+    let dp_inover = pac::IO_BANK0.gpio(dp_pin).ctrl().read().inover().to_bits();
+    let dm_inover = pac::IO_BANK0.gpio(dm_pin).ctrl().read().inover().to_bits();
     observation.input_override_snapshot = dp_inover | (dm_inover << 2);
 }
 
@@ -2275,12 +2361,14 @@ fn forget_unused_state_machine<'d, PIO: PioInstance, const SM: usize>(
 
 #[inline(always)]
 fn configure_rx_input_inversion() {
+    let dp_pin = ROOT_DP_PIN.load(Ordering::Relaxed) as usize;
+    let dm_pin = ROOT_DM_PIN.load(Ordering::Relaxed) as usize;
     pac::IO_BANK0
-        .gpio(16)
+        .gpio(dp_pin)
         .ctrl()
         .modify(|w| w.set_inover(pac::io::vals::Inover::INVERT));
     pac::IO_BANK0
-        .gpio(17)
+        .gpio(dm_pin)
         .ctrl()
         .modify(|w| w.set_inover(pac::io::vals::Inover::INVERT));
 }

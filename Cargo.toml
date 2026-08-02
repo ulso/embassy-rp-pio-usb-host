@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
-description = "Experimental full- and low-speed PIO USB host for RP2040 using Embassy"
+description = "Experimental full- and low-speed PIO USB host for RP2040 and RP2350 using Embassy"
 homepage = "https://github.com/ulso/embassy-rp-pio-usb-host"
 repository = "https://github.com/ulso/embassy-rp-pio-usb-host"
 documentation = "https://github.com/ulso/embassy-rp-pio-usb-host#readme"
@@ -15,9 +15,11 @@ publish = false
 autoexamples = false
 
 [features]
-default = ["embassy-usb-host"]
+default = ["embassy-usb-host", "rp2040"]
 analyzer-capture = []
 embassy-usb-host = ["dep:embassy-usb-host"]
+rp2040 = ["embassy-rp/rp2040"]
+rp235xa = ["embassy-rp/rp235xa"]
 
 [dependencies]
 embassy-sync = "=0.8.0"
@@ -56,7 +58,7 @@ defmt = "1.0.1"
 defmt-rtt = "1.0.0"
 embassy-executor = { version = "0.10.0", features = ["defmt", "executor-thread", "platform-cortex-m"] }
 embassy-futures = "=0.1.2"
-embassy-rp = { version = "=0.10.0", features = ["critical-section-impl", "defmt", "rp2040", "time-driver", "unstable-pac"] }
+embassy-rp = { version = "=0.10.0", features = ["critical-section-impl", "defmt", "time-driver", "unstable-pac"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
 fixed = "=1.31.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
