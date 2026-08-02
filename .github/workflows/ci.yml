@@ -41,7 +41,7 @@ jobs:
         run: cargo check --release --locked --lib --target thumbv6m-none-eabi
 
   embedded:
-    name: RP2040 release build and lint
+    name: Embedded release builds and lint
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -53,7 +53,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: clippy,rustfmt
-          targets: thumbv6m-none-eabi
+          targets: thumbv6m-none-eabi,thumbv8m.main-none-eabihf
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -73,4 +73,12 @@ jobs:
       - name: Build embedded documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --lib --all-features --no-deps --target thumbv6m-none-eabi
+        run: cargo doc --locked --lib --no-default-features --features embassy-usb-host,rp2040 --no-deps --target thumbv6m-none-eabi
+
+      - name: Run RP2350 library Clippy
+        run: cargo clippy --release --locked --lib --no-default-features --features embassy-usb-host,rp235xa --target thumbv8m.main-none-eabihf -- -D warnings
+
+      - name: Build RP2350 documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --lib --no-default-features --features embassy-usb-host,rp235xa --no-deps --target thumbv8m.main-none-eabihf
